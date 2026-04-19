@@ -80,8 +80,25 @@ export default function LoginPage() {
     const usernameInput = form.querySelector('input[name="username"]') as HTMLInputElement | null;
     const passwordInput = form.querySelector('input[name="password"]') as HTMLInputElement | null;
 
+    // Always refetch CSRF immediately before the POST. The mount-time fetch
+    // can race with React Strict Mode's double-invocation — two in-flight
+    // GETs on /api/auth/csrf set two different cookies, and whichever response
+    // arrives last wins the cookie jar, which may not match csrfTokenRef.
+    // Re-fetching here guarantees the token in the body matches the live cookie.
+    let freshToken = csrfTokenRef.current || '';
+    try {
+      const csrfRes = await fetch('/api/auth/csrf', { credentials: 'same-origin', cache: 'no-store' });
+      const csrfData = await csrfRes.json();
+      if (csrfData?.csrfToken) {
+        freshToken = csrfData.csrfToken;
+        csrfTokenRef.current = freshToken;
+      }
+    } catch (err) {
+      console.error('[login] csrf refresh failed, using cached token:', err);
+    }
+
     const body = new URLSearchParams();
-    body.set('csrfToken', csrfTokenRef.current || '');
+    body.set('csrfToken', freshToken);
     body.set('username', usernameInput?.value || '');
     body.set('password', passwordInput?.value || '');
 
