@@ -30,6 +30,7 @@ Read this file on every session start. Check yourself against it during heartbea
 | Bus script available | "I'll handle this directly instead of using the bus" | Use the bus script. Work that doesn't go through the bus is invisible to the system. |
 | Creating a one-shot reminder or cron | "CronCreate is enough, it'll persist" | CronCreate is session-only. Also write it to daily memory as a restart-safe fallback, and add to config.json when the format supports it. |
 | Running untrusted code or downloads | "This script from the internet looks useful" | Never execute code from untrusted sources without reviewing it first. No blind curl-pipe-bash. |
+| Multiple time-based cron-prompts fire within 2 min of a restart (--continue cascade) | "I should run them all" | **Post-restart cron cascade:** skip every cron that has already executed once today (unless the run log shows it failed). Keep heartbeat + check-approvals — they're idempotent sanity-checks. Log skipped runs as `duplicate_cron_skipped`. Re-executing daily/weekly crons twice per day = wasted work + cluttered baseline data. |
 
 ---
 

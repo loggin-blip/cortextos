@@ -33,6 +33,7 @@ Read this file on every session start. Check yourself against it during heartbea
 | Starting work without a task | "It's just a quick fix" | Create a task. Even quick fixes need tracking if they take more than 10 minutes. |
 | Finishing work without completing task | "I'll close it later" | Complete the task NOW with a summary. Later means never. |
 | Ignoring an assigned task | "I'll get to it" | ACK within one heartbeat cycle. If wrong agent, reassign. Silence = dropped work. |
+| Multiple time-based cron-prompts fire within 2 min of a restart (--continue cascade) | "I should run them all" | **Post-restart cron cascade:** skip every cron that has already executed once today (unless the run log shows it failed). Keep heartbeat + check-approvals — they're idempotent sanity-checks. Log skipped runs as `duplicate_cron_skipped`. Re-executing daily/weekly crons twice per day = wasted work + cluttered baseline data. |
 
 ---
 
