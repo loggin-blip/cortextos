@@ -1,0 +1,59 @@
+{
+  "version": "1.0",
+  "denylist": [
+    "message/agent_message_sent",
+    "message/telegram_sent",
+    "message/inbox_ack",
+    "heartbeat/heartbeat",
+    "heartbeat/agent_heartbeat",
+    "action/session_start",
+    "action/session_restart",
+    "action/baseline_snapshot",
+    "action/metrics_collected",
+    "action/approval_scan",
+    "action/approval_scan_manual",
+    "action/approvals_manual_scan",
+    "action/duplicate_cron_skipped",
+    "task/task_created",
+    "task/task_dispatched"
+  ],
+  "allowlist": [
+    "action/decision_made",
+    "action/approval_created",
+    "action/approval_resolved",
+    "action/approval_routed",
+    "action/merge_applied",
+    "action/framework_upgrade_merged",
+    "action/merge_fully_complete",
+    "action/merge_prework",
+    "action/merge_phase_complete",
+    "action/theta_wave_started",
+    "action/theta_wave_completed",
+    "action/trigger_fired",
+    "action/watch_set",
+    "action/diagnosis_corrected",
+    "action/policy_draft_parked",
+    "action/voice_bot_live",
+    "action/agent_spawned",
+    "action/skill_created",
+    "action/briefing_sent",
+    "action/git_snapshot",
+    "action/upstream_check",
+    "action/cron_gap_detected",
+    "action/cron_recreated",
+    "action/experiment_loop"
+  ],
+  "grayZonePolicy": {
+    "task/task_completed": {
+      "minResultLen": 20,
+      "requiredFields": ["result"]
+    },
+    "task/task_blocked": {
+      "requiredFields": ["blocker_reason"]
+    }
+  },
+  "patterns": {
+    "allowlistPrefixes": ["action/L_"]
+  },
+  "default": "deny"
+}
