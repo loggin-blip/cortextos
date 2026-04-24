@@ -56,6 +56,10 @@ export class AgentProcess {
   private dedup: MessageDedup;
   private log: LogFn;
   private onStatusChange: ((status: AgentStatus) => void) | null = null;
+  /** Buffered injection messages flushed together after a short window. See injectMessage. */
+  private pendingInjectionBuffer: string[] = [];
+  private injectionFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly INJECTION_BUFFER_MS = 5000;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -170,6 +174,15 @@ export class AgentProcess {
     this.log('Stopping...');
     this.clearSessionTimer();
 
+    // Clear any pending injection buffer — agent is stopping, messages in
+    // the buffer are either already ACK'd in the inbox (and will re-deliver
+    // on next check) or will arrive via the inbox after restart.
+    if (this.injectionFlushTimer) {
+      clearTimeout(this.injectionFlushTimer);
+      this.injectionFlushTimer = null;
+    }
+    this.pendingInjectionBuffer = [];
+
     // Capture and null out pty BEFORE any awaits so handleExit() during graceful
     // shutdown doesn't race with us and trigger crash recovery or a double-kill.
     const pty = this.pty;
@@ -255,8 +268,19 @@ export class AgentProcess {
 
   /**
    * Inject a message into the agent's PTY.
+   *
+   * Messages are buffered for up to BUFFER_MS so bursts (e.g. 3 Telegram
+   * messages within 10 seconds) arrive as a single injection rather than
+   * N separate ones. The agent then processes them in a single context
+   * turn instead of N — significantly cheaper and produces more coherent
+   * replies.
+   *
+   * Pass `{ bypass: true }` for messages that must arrive immediately
+   * without waiting for the buffer window (urgent system messages,
+   * cron verifications, context-window warnings, handoff prompts).
+   * Bypass flushes any pending buffer first to preserve ordering.
    */
-  injectMessage(content: string): boolean {
+  injectMessage(content: string, opts: { bypass?: boolean } = {}): boolean {
     if (!this.pty || this.status !== 'running') {
       return false;
     }
@@ -266,8 +290,54 @@ export class AgentProcess {
       return false;
     }
 
-    injectMessage((data) => this.pty?.write(data), content);
+    if (opts.bypass) {
+      // Flush any pending messages first so ordering is preserved
+      this.flushInjectionBuffer();
+      injectMessage((data) => this.pty?.write(data), content);
+      return true;
+    }
+
+    // Buffer the message and reset the flush timer
+    this.pendingInjectionBuffer.push(content);
+    if (this.injectionFlushTimer) {
+      clearTimeout(this.injectionFlushTimer);
+    }
+    this.injectionFlushTimer = setTimeout(
+      () => this.flushInjectionBuffer(),
+      AgentProcess.INJECTION_BUFFER_MS,
+    );
     return true;
+  }
+
+  /**
+   * Flush any buffered injection messages immediately.
+   * Called by the 5s timer, by bypass-injections to preserve order,
+   * and by stop() to prevent messages hanging during restart.
+   */
+  private flushInjectionBuffer(): void {
+    if (this.injectionFlushTimer) {
+      clearTimeout(this.injectionFlushTimer);
+      this.injectionFlushTimer = null;
+    }
+    if (this.pendingInjectionBuffer.length === 0) return;
+    if (!this.pty || this.status !== 'running') {
+      // Agent not available — drop the buffer. These are TG/bus messages
+      // that will be re-delivered from the inbox on next check.
+      this.pendingInjectionBuffer = [];
+      return;
+    }
+
+    const messages = this.pendingInjectionBuffer;
+    this.pendingInjectionBuffer = [];
+
+    const combined = messages.length === 1
+      ? messages[0]
+      : messages.join('\n\n---\n\n');
+
+    injectMessage((data) => this.pty?.write(data), combined);
+    if (messages.length > 1) {
+      this.log(`Flushed injection buffer: ${messages.length} messages combined`);
+    }
   }
 
   /**

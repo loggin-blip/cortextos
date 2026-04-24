@@ -849,10 +849,10 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         this.log(`Urgent signal detected: ${content}`);
         unlinkSync(urgentPath);
 
-        // Inject the urgent message
+        // Inject the urgent message (bypass buffer — urgent must arrive immediately)
         if (content) {
           const urgentMsg = `=== URGENT SIGNAL ===\n\`\`\`\n${content}\n\`\`\`\n\n`;
-          this.agent.injectMessage(urgentMsg);
+          this.agent.injectMessage(urgentMsg, { bypass: true });
         }
       } catch (err) {
         this.log(`Error processing urgent signal: ${err}`);
@@ -962,7 +962,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       this.ctxWarningFiredAt = now;
       const pctRound = Math.round(effectivePct);
       const statusSuffix = effectivePct >= handoff ? 'Handoff in progress.' : `Handoff triggers at ${handoff}%.`;
-      this.agent.injectMessage(`[CONTEXT] Window at ${pctRound}%. ${statusSuffix}`);
+      this.agent.injectMessage(`[CONTEXT] Window at ${pctRound}%. ${statusSuffix}`, { bypass: true });
       this.log(`Context warning fired at ${pctRound}%`);
     }
 
@@ -977,7 +977,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       } catch { /* non-fatal */ }
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + 'Z';
       const handoffPrompt = `[CONTEXT HANDOFF REQUIRED] Context is at ${Math.round(effectivePct)}%. Write a handoff document to memory/handoffs/handoff-${ts}.md with these sections: ## Current Tasks, ## Next Actions, ## Active Crons, ## Key Context, ## Files Modified This Session. Then run: cortextos bus hard-restart --reason "context handoff at ${Math.round(effectivePct)}%" --handoff-doc <absolute path to the handoff doc you just wrote>. Do this NOW before the context window is exhausted.`;
-      this.agent.injectMessage(handoffPrompt);
+      this.agent.injectMessage(handoffPrompt, { bypass: true });
       this.log(`Handoff prompt injected at ${Math.round(effectivePct)}%`);
       // Pre-arm .force-fresh so the next restart is always a clean fresh session.
       // If the agent cooperates and calls hard-restart, it also writes .force-fresh — no-op.
