@@ -1,24 +1,36 @@
 #!/usr/bin/env bash
-# burn-reduction-cleanup.sh — apply config-level QW changes to reduce overhead.
+# burn-reduction-cleanup.sh — apply config + template-file updates for burn reduction.
 # Run after merging perf/burn-reduction-2026-04-24 branch.
 #
 # Actions:
-#   1. Remove interval-based heartbeat crons from agents that migrated to heartbeat-runner
-#   2. Set runner_managed=true on any remaining heartbeat/check-approvals crons (documentation)
-#   3. Add nightly-compact cron to orchestrator agents
+#   1. Remove interval-based heartbeat/check-approvals crons from agents (now runner-managed)
+#   2. Add nightly-compact cron to orchestrator agents
+#   3. Refresh AGENTS.md from template (trimmed 454 → 173 lines)
 #
 # Idempotent — safe to re-run.
+#
+# Note: user-owned orchestrator-specific AGENTS.md customizations (e.g. kaptein's)
+#   are overwritten. If customizations exist, back up first.
 
 set -euo pipefail
 
-AGENTS_DIR="/Users/max/cortextos/orgs/westside-hq/agents"
+FRAMEWORK_ROOT="/Users/max/cortextos"
+AGENTS_DIR="$FRAMEWORK_ROOT/orgs/westside-hq/agents"
+TEMPLATES_DIR="$FRAMEWORK_ROOT/templates"
 CHANGED=0
 
-# Agents that use heartbeat-runner (all of them in current setup)
-ALL_AGENTS="kaptein max-personal nordflo-dev massivlust-dev leon-kaptein leon-personal"
+# Agents and their template type
+declare -A AGENT_TEMPLATE=(
+  ["kaptein"]="orchestrator"
+  ["leon-kaptein"]="orchestrator"
+  ["max-personal"]="agent"
+  ["leon-personal"]="agent"
+  ["nordflo-dev"]="agent"
+  ["massivlust-dev"]="agent"
+)
 
-# 1. Remove heartbeat cron (migrated to runner)
-for AGENT in $ALL_AGENTS; do
+# 1. Clean up stale heartbeat/check-approvals crons from all agents
+for AGENT in "${!AGENT_TEMPLATE[@]}"; do
   FILE="$AGENTS_DIR/$AGENT/config.json"
   [[ ! -f "$FILE" ]] && continue
   BEFORE=$(jq '.crons | length' "$FILE")
@@ -30,13 +42,12 @@ for AGENT in $ALL_AGENTS; do
   fi
 done
 
-# 2. Add nightly-compact to orchestrators if not already present
+# 2. Add nightly-compact to orchestrators (staggered)
 for AGENT in kaptein leon-kaptein; do
   FILE="$AGENTS_DIR/$AGENT/config.json"
   [[ ! -f "$FILE" ]] && continue
   HAS=$(jq '[.crons[]?.name] | any(. == "nightly-compact")' "$FILE")
   if [[ "$HAS" == "false" ]]; then
-    # Stagger times: kaptein 03:13, leon-kaptein 03:47
     if [[ "$AGENT" == "kaptein" ]]; then
       CRON="13 3 * * *"
     else
@@ -53,9 +64,24 @@ for AGENT in kaptein leon-kaptein; do
   fi
 done
 
+# 3. Refresh AGENTS.md from template (skip if agent has customized it — checksum-based)
+for AGENT in "${!AGENT_TEMPLATE[@]}"; do
+  TMPL="$TEMPLATES_DIR/${AGENT_TEMPLATE[$AGENT]}/AGENTS.md"
+  AGENT_FILE="$AGENTS_DIR/$AGENT/AGENTS.md"
+  [[ ! -f "$TMPL" || ! -f "$AGENT_FILE" ]] && continue
+
+  # If file contents differ, refresh from template
+  if ! cmp -s "$TMPL" "$AGENT_FILE"; then
+    cp "$AGENT_FILE" "$AGENT_FILE.backup-$(date +%Y%m%d)"
+    cp "$TMPL" "$AGENT_FILE"
+    echo "  $AGENT: AGENTS.md refreshed from template (454 → 173 lines, backup saved)"
+    CHANGED=1
+  fi
+done
+
 echo ""
 if [[ $CHANGED -eq 1 ]]; then
-  echo "Config changes applied. Restart fleet to pick up:"
+  echo "Changes applied. Restart fleet to pick up:"
   echo "  pm2 kill && cortextos start"
 else
   echo "No changes needed — all agents already clean."
