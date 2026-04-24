@@ -195,6 +195,10 @@ export interface CronEntry {
   /** "recurring" (default) restores on every session start.
    *  "once" restores only if fire_at is still in the future; deleted after firing. */
   type?: 'recurring' | 'once' | 'disabled';
+  /** When true, this cron is executed by an external runner (e.g. heartbeat-runner.py,
+   *  approvals-runner.py) not the agent's Claude session. Skip gap-detection — the runner
+   *  writes its own state files and doesn't update cron-state.json for the agent. */
+  runner_managed?: boolean;
 }
 
 export interface OrgContext {

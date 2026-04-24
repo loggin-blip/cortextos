@@ -724,9 +724,11 @@ export class AgentProcess {
     const crons = this.config.crons;
     if (!crons || crons.length === 0) return;
 
-    // Only monitor recurring crons with a parseable interval (skip cron expressions)
+    // Only monitor recurring crons with a parseable interval (skip cron expressions).
+    // Also skip runner_managed crons: external runners (Python workers) handle these
+    // and don't update cron-state.json for the agent — they'd always look stale.
     const monitorable = crons.filter(
-      c => c.type !== 'once' && c.type !== 'disabled' && c.interval && !isNaN(parseDurationMs(c.interval)),
+      c => c.type !== 'once' && c.type !== 'disabled' && !c.runner_managed && c.interval && !isNaN(parseDurationMs(c.interval)),
     );
     if (monitorable.length === 0) return;
 
