@@ -10,6 +10,12 @@ import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { readCronState, parseDurationMs } from '../bus/cron-state.js';
 import { resolvePaths } from '../utils/paths.js';
+import {
+  computeBootstrapFingerprint,
+  readBootstrapFingerprint,
+  writeBootstrapFingerprint,
+  compareBootstrapFingerprints,
+} from './bootstrap-fingerprint.js';
 
 type LogFn = (msg: string) => void;
 
@@ -552,6 +558,12 @@ export class AgentProcess {
     const onlineMessage = isHandoffRestart
       ? ''
       : ' After setting up crons, send a Telegram message to the user saying you are back online.';
+
+    // Write the baseline fingerprint on fresh-session start so --continue
+    // restarts have a reference to compare against.
+    const stateDir = join(this.env.ctxRoot, 'state', this.name);
+    writeBootstrapFingerprint(stateDir, computeBootstrapFingerprint(this.env.agentDir));
+
     return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. Then restore your crons from config.json: for each entry with type "recurring" (or no type field), call /loop {interval} {prompt}; for each entry with type "once", compare fire_at against the current UTC time above — if fire_at is still in the future recreate the CronCreate, if fire_at is in the past delete that entry from config.json. CRITICAL DEDUP: Always call CronList BEFORE creating any cron. For each config.json entry, search the CronList output for its prompt text — if the prompt already appears, SKIP that cron entirely. Only call /loop or CronCreate for entries whose prompt text is NOT already listed. This prevents rapid --continue restarts from accumulating duplicate schedules.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
   }
 
@@ -559,7 +571,33 @@ export class AgentProcess {
     const nowUtc = new Date().toISOString();
     const reminderBlock = this.buildReminderBlock();
     const deliverablesBlock = this.buildDeliverablesBlock();
-    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved, so AGENTS.md and bootstrap files are already in your context — do NOT re-read them unless a file's mtime has changed since your last session. ONLY refresh: (1) memory/$(date -u +%Y-%m-%d).md if the date rolled over, (2) any bootstrap file whose mtime is newer than your last session_start event. Restore your crons from config.json ONLY if missing. CRITICAL DEDUP: Call CronList FIRST. For each config.json entry, search the CronList output for its prompt text — if the prompt already appears, SKIP that cron. Only call /loop (recurring) or CronCreate (once, if fire_at is in the future) for entries whose prompt text is NOT already listed. Rapid --continue restarts must not accumulate duplicates.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations. After restoring crons and checking inbox, send a Telegram message to the user saying you are back online.`;
+
+    // Bootstrap-fingerprint check: if bootstrap files haven't changed since
+    // last session, tell the agent to skip re-reading them entirely (they're
+    // already in context from the preserved --continue history). Saves
+    // ~10-15k tokens per restart when nothing has changed.
+    const stateDir = join(this.env.ctxRoot, 'state', this.name);
+    const currentFingerprint = computeBootstrapFingerprint(this.env.agentDir);
+    const storedFingerprint = readBootstrapFingerprint(stateDir);
+    const cmp = compareBootstrapFingerprints(currentFingerprint, storedFingerprint);
+
+    let contextBlock: string;
+    if (cmp.status === 'unchanged') {
+      contextBlock = `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. BOOTSTRAP UNCHANGED SINCE LAST SESSION — do NOT re-read AGENTS.md, IDENTITY.md, SOUL.md, USER.md, GOALS.md, MEMORY.md, or today's memory/YYYY-MM-DD.md. They are already in your context.`;
+    } else if (cmp.status === 'missing-prior') {
+      contextBlock = `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved, so AGENTS.md and bootstrap files should already be in your context. Re-read them only if you need to refresh context. (No prior fingerprint to compare against.)`;
+    } else {
+      const changeList = cmp.changedFiles.length > 0
+        ? `CHANGED FILES since last session: ${cmp.changedFiles.join(', ')}.`
+        : '';
+      const rollover = cmp.dateRollover ? ' Date has rolled over — refresh today\'s memory/YYYY-MM-DD.md.' : '';
+      contextBlock = `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. ${changeList}${rollover} Re-read ONLY the changed files — other bootstrap files are already in context and do not need re-reading.`;
+    }
+
+    // Persist the current fingerprint so next session can compare.
+    writeBootstrapFingerprint(stateDir, currentFingerprint);
+
+    return `${contextBlock} Restore your crons from config.json ONLY if missing. CRITICAL DEDUP: Call CronList FIRST. For each config.json entry, search the CronList output for its prompt text — if the prompt already appears, SKIP that cron. Only call /loop (recurring) or CronCreate (once, if fire_at is in the future) for entries whose prompt text is NOT already listed. Rapid --continue restarts must not accumulate duplicates.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations. After restoring crons and checking inbox, send a Telegram message to the user saying you are back online.`;
   }
 
   /**
