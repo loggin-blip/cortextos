@@ -53,3 +53,9 @@ BRAINDUMP*.md
 AGENTS.md
 dashboard/screenshots/
 dashboard/test-*.py
+
+# Agent/org secrets
+orgs/*/secrets/
+orgs/*/secrets.*
+**/wda-fleet-agent-key.json
+**/*-key.json
