@@ -215,9 +215,10 @@ export class AgentManager {
         botToken = undefined;
       }
 
-      // ALLOWED_USER must be a numeric Telegram user ID, not a username
-      if (allowedUserId && !/^\d+$/.test(allowedUserId)) {
-        log(`SECURITY: ALLOWED_USER is not a numeric ID. Telegram user IDs are numbers (e.g. 123456789). Refusing to enable Telegram. Fix the .env file.`);
+      // ALLOWED_USER must be numeric Telegram user ID(s). Supports comma-separated
+      // for multi-user bots (e.g. team bots serving multiple employees).
+      if (allowedUserId && !/^\d+(,\d+)*$/.test(allowedUserId)) {
+        log(`SECURITY: ALLOWED_USER is not numeric ID(s). Use a single ID (123456789) or comma-separated (123,456,789). Refusing to enable Telegram. Fix the .env file.`);
         allowedUserId = undefined;
       }
 
@@ -242,7 +243,9 @@ export class AgentManager {
       log,
       telegramApi,
       chatId,
-      allowedUserId: allowedUserId ? parseInt(allowedUserId, 10) : undefined,
+      allowedUserIds: allowedUserId
+        ? new Set(allowedUserId.split(',').map(id => parseInt(id.trim(), 10)))
+        : undefined,
     });
 
     // Send Telegram notification on crashes and session refreshes
@@ -299,11 +302,11 @@ export class AgentManager {
       const poller = new TelegramPoller(telegramApi, stateDir);
 
       poller.onMessage((msg) => {
-        // ALLOWED_USER gate: if configured, ignore messages from other users.
-        // Use numeric comparison to avoid string coercion issues.
+        // ALLOWED_USER gate: if configured, ignore messages from non-whitelisted users.
+        // Supports comma-separated IDs for multi-user bots (team bots).
         if (allowedUserId) {
-          const allowedId = parseInt(allowedUserId, 10);
-          if (msg.from?.id !== allowedId) {
+          const allowedIds = new Set(allowedUserId.split(',').map(id => parseInt(id.trim(), 10)));
+          if (!allowedIds.has(msg.from?.id ?? 0)) {
             log(`Ignoring message from unauthorized user (allowed_user gate)`);
             return;
           }
@@ -409,11 +412,10 @@ export class AgentManager {
       });
 
       poller.onReaction((reaction) => {
-        // ALLOWED_USER gate: same rule as message handler. If configured,
-        // ignore reactions from other users.
+        // ALLOWED_USER gate: same rule as message handler.
         if (allowedUserId) {
-          const allowedId = parseInt(allowedUserId, 10);
-          if (reaction.user?.id !== allowedId) {
+          const allowedIds = new Set(allowedUserId.split(',').map(id => parseInt(id.trim(), 10)));
+          if (!allowedIds.has(reaction.user?.id ?? 0)) {
             log('Ignoring reaction from unauthorized user (allowed_user gate)');
             return;
           }
