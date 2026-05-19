@@ -1,9 +1,9 @@
-import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'fs';
+import { appendFileSync, existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'fs';
 import { join, sep } from 'path';
 import { homedir } from 'os';
 import type { AgentConfig, AgentStatus, CtxEnv } from '../types/index.js';
 import { AgentPTY } from '../pty/agent-pty.js';
-import { CodexPTY } from '../pty/codex-pty.js';
+import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
 import { MessageDedup, injectMessage } from '../pty/inject.js';
 import type { TelegramAPI } from '../telegram/api.js';
@@ -28,10 +28,16 @@ export class AgentProcess {
   readonly name: string;
   private env: CtxEnv;
   private config: AgentConfig;
-  private pty: AgentPTY | CodexPTY | null = null;
+  private pty: AgentPTY | CodexAppServerPTY | null = null;
   private sessionTimer: ReturnType<typeof setTimeout> | null = null;
   private crashCount: number = 0;
   private maxCrashesPerDay: number = 10;
+  // CrashLoopPauser (instar-inspired): sliding-window crash detection.
+  // Timestamps of recent crashes within the configured window. If the
+  // window fills, the agent auto-pauses instead of retrying with backoff.
+  private crashTimestamps: number[] = [];
+  private crashWindowMs: number = 0;
+  private crashWindowMax: number = 0;
   private sessionStart: Date | null = null;
   private status: AgentStatus['status'] = 'stopped';
   private stopping: boolean = false;
@@ -64,10 +70,15 @@ export class AgentProcess {
   private pendingInjectionBuffer: string[] = [];
   private injectionFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly INJECTION_BUFFER_MS = 5000;
-  // Issue #330: held here so CodexPTY can be re-wired across session refresh
+  // Issue #330: held here so CodexAppServerPTY can be re-wired across session refresh
   // (each start() recreates the PTY, but the Telegram handle persists).
   private telegramApi: TelegramAPI | null = null;
   private telegramChatId: string | null = null;
+  // Issue #392: tracks whether the most recently built startup prompt consumed
+  // a handoff doc marker. start() reads this after spawn to decide whether the
+  // daemon should fire the codex-app-server back-online Telegram directly
+  // (skipped on handoff restart — the agent sends its own contextual reply).
+  private lastSpawnWasHandoff = false;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -75,6 +86,10 @@ export class AgentProcess {
     this.config = config;
     if (config.max_crashes_per_day !== undefined) {
       this.maxCrashesPerDay = config.max_crashes_per_day;
+    }
+    if (config.crash_window?.seconds) {
+      this.crashWindowMs = config.crash_window.seconds * 1000;
+      this.crashWindowMax = config.crash_window.max_crashes ?? 3;
     }
     this.dedup = new MessageDedup();
     this.log = log || ((msg) => console.log(`[${name}] ${msg}`));
@@ -126,15 +141,15 @@ export class AgentProcess {
     this.log(`Log path: ${logPath}`);
     this.pty = this.config.runtime === 'hermes'
       ? new HermesPTY(this.env, this.config, logPath)
-      : this.config.runtime === 'codex'
-        ? new CodexPTY(this.env, this.config, logPath)
+      : this.config.runtime === 'codex-app-server'
+        ? new CodexAppServerPTY(this.env, this.config, logPath)
         : new AgentPTY(this.env, this.config, logPath);
 
     // Issue #330: re-wire the Telegram handle on every start() (session refresh
-    // creates a fresh CodexPTY). Only CodexPTY uses this — Claude / Hermes
+    // creates a fresh CodexAppServerPTY). Only CodexAppServerPTY uses this — Claude / Hermes
     // typing indicators flow through fast-checker.
-    if (this.config.runtime === 'codex' && this.telegramApi && this.telegramChatId) {
-      (this.pty as CodexPTY).setTelegramHandle(this.telegramApi, this.telegramChatId);
+    if (this.config.runtime === 'codex-app-server' && this.telegramApi && this.telegramChatId) {
+      (this.pty as CodexAppServerPTY).setTelegramHandle(this.telegramApi, this.telegramChatId);
     }
 
     // BUG-011 fix: create a fresh exit signal for this run. resolveExit is
@@ -164,7 +179,7 @@ export class AgentProcess {
     try {
       await this.pty.spawn(mode, prompt);
       // Codex exec-per-turn race: the new PTY's onExit can fire BEFORE this
-      // line if `codex exec` completes its prompt quickly (CodexPTY's spawn
+      // line if `codex exec` completes its prompt quickly (CodexAppServerPTY's spawn
       // resolves once exec is launched, but the process may exit moments
       // later as it finishes the bootstrap turn). handleExit() nulls
       // this.pty and schedules crash recovery — we must not claim 'running'
@@ -176,6 +191,13 @@ export class AgentProcess {
       this.status = 'running';
       this.sessionStart = new Date();
       this.log(`Running (pid: ${this.pty.getPid()})`);
+
+      // Issue #392: codex-app-server does not reliably execute the inline
+      // "Send a Telegram message saying you are back online" instruction the
+      // way claude-code does, so fire the back-online ping directly from the
+      // daemon for that runtime. Skipped on handoff restart — the agent
+      // sends its own contextual "back — ..." reply in that case.
+      this.maybeSendCodexBootNotification();
 
       // Start session timer
       this.startSessionTimer();
@@ -226,9 +248,9 @@ export class AgentProcess {
           // so we use Ctrl+D which exits cleanly on the first press.
           pty.write('\x04'); // Ctrl+D
           await sleep(3000);
-        } else if (this.config.runtime === 'codex') {
+        } else if (this.config.runtime === 'codex-app-server') {
           // Codex uses an exec-per-turn model — there is no persistent REPL
-          // between turns, so /exit + sleep below are no-ops on CodexPTY
+          // between turns, so /exit + sleep below are no-ops on CodexAppServerPTY
           // (write() just buffers). The only meaningful stop step is
           // pty.kill(), which terminates the in-flight `codex exec` (if any)
           // and flips _alive=false. Skipping the 6s Claude-REPL dance makes
@@ -302,37 +324,29 @@ export class AgentProcess {
   }
 
   /**
-   * Inject a message into the agent's PTY.
+   * Inject a message into the agent's PTY — structured outcome.
    *
-   * Messages are buffered for up to BUFFER_MS so bursts (e.g. 3 Telegram
-   * messages within 10 seconds) arrive as a single injection rather than
-   * N separate ones. The agent then processes them in a single context
-   * turn instead of N — significantly cheaper and produces more coherent
-   * replies.
+   * Messages are buffered for up to BUFFER_MS so bursts arrive as a single
+   * injection. Pass `{ bypass: true }` for urgent messages.
    *
-   * Pass `{ bypass: true }` for messages that must arrive immediately
-   * without waiting for the buffer window (urgent system messages,
-   * cron verifications, context-window warnings, handoff prompts).
-   * Bypass flushes any pending buffer first to preserve ordering.
+   * Distinguishes NOT_RUNNING from DEDUPED (issue #346).
    */
-  injectMessage(content: string, opts: { bypass?: boolean } = {}): boolean {
+  injectMessageDetailed(content: string, opts: { bypass?: boolean } = {}): { ok: true } | { ok: false; code: 'NOT_RUNNING' | 'DEDUPED'; message: string } {
     if (!this.pty || this.status !== 'running') {
-      return false;
+      return { ok: false, code: 'NOT_RUNNING', message: `agent "${this.name}" is registered but not running (status: ${this.status})` };
     }
 
     if (this.dedup.isDuplicate(content)) {
       this.log('Dedup: skipping duplicate message');
-      return false;
+      return { ok: false, code: 'DEDUPED', message: `inject for "${this.name}" deduped — content matches MessageDedup hash window` };
     }
 
     if (opts.bypass) {
-      // Flush any pending messages first so ordering is preserved
       this.flushInjectionBuffer();
       injectMessage((data) => this.pty?.write(data), content);
-      return true;
+      return { ok: true };
     }
 
-    // Buffer the message and reset the flush timer
     this.pendingInjectionBuffer.push(content);
     if (this.injectionFlushTimer) {
       clearTimeout(this.injectionFlushTimer);
@@ -341,7 +355,14 @@ export class AgentProcess {
       () => this.flushInjectionBuffer(),
       AgentProcess.INJECTION_BUFFER_MS,
     );
-    return true;
+    return { ok: true };
+  }
+
+  /**
+   * Back-compat boolean wrapper. New callers should use injectMessageDetailed().
+   */
+  injectMessage(content: string, opts: { bypass?: boolean } = {}): boolean {
+    return this.injectMessageDetailed(content, opts).ok;
   }
 
   /**
@@ -407,15 +428,15 @@ export class AgentProcess {
   }
 
   /**
-   * Wire the agent's Telegram bot handle. Used by CodexPTY (issue #330) to
+   * Wire the agent's Telegram bot handle. Used by CodexAppServerPTY (issue #330) to
    * fire sendChatAction directly from the JSONL stream. Safe to call before
    * or after start() — the handle is re-applied on every PTY (re)spawn.
    */
   setTelegramHandle(api: TelegramAPI, chatId: string): void {
     this.telegramApi = api;
     this.telegramChatId = chatId;
-    if (this.config.runtime === 'codex' && this.pty) {
-      (this.pty as CodexPTY).setTelegramHandle(api, chatId);
+    if (this.config.runtime === 'codex-app-server' && this.pty) {
+      (this.pty as CodexAppServerPTY).setTelegramHandle(api, chatId);
     }
   }
 
@@ -496,7 +517,31 @@ export class AgentProcess {
       return;
     }
 
-    // Check crash limit
+    // CrashLoopPauser (instar-inspired): if a sliding window is configured,
+    // check whether the agent is crash-looping before falling through to
+    // the legacy daily counter. The window is a more precise signal than
+    // the per-day count: 3 crashes in 30 minutes is a crash loop even if
+    // the daily budget of 10 is far from exhausted.
+    if (this.crashWindowMs > 0) {
+      const now = Date.now();
+      this.crashTimestamps.push(now);
+      // Prune timestamps outside the window.
+      this.crashTimestamps = this.crashTimestamps.filter(
+        (ts) => now - ts <= this.crashWindowMs,
+      );
+      if (this.crashTimestamps.length >= this.crashWindowMax) {
+        this.log(
+          `CRASH_LOOP: ${this.crashTimestamps.length} crashes in ${this.crashWindowMs / 1000}s window — auto-pausing`,
+        );
+        this.appendCrashToRestartsLog(exitCode, 0, 'CRASH_LOOP');
+        this.status = 'halted';
+        this.notifyStatusChange();
+        return;
+      }
+    }
+
+    // Legacy daily crash counter (fallback when no crash_window is configured,
+    // or as a secondary gate when the window hasn't filled yet).
     this.crashCount++;
     const today = new Date().toISOString().split('T')[0];
     this.resetCrashCountIfNewDay(today);
@@ -591,6 +636,7 @@ export class AgentProcess {
     const deliverablesBlock = this.buildDeliverablesBlock();
     const handoffBlock = this.consumeHandoffBlock();
     const isHandoffRestart = handoffBlock.length > 0;
+    this.lastSpawnWasHandoff = isHandoffRestart;
     // HANDOFF UX: the pickup message MUST be the first action after reading the handoff doc —
     // before cron restoration, before heartbeat, before anything else. Placing this instruction
     // immediately after the handoffBlock in the prompt ensures it is not buried.
@@ -612,10 +658,9 @@ export class AgentProcess {
     const nowUtc = new Date().toISOString();
     const reminderBlock = this.buildReminderBlock();
     const deliverablesBlock = this.buildDeliverablesBlock();
-    // Bootstrap-fingerprint check: if bootstrap files haven't changed since
-    // last session, tell the agent to skip re-reading them entirely (they're
-    // already in context from the preserved --continue history). Saves
-    // ~10-15k tokens per restart when nothing has changed.
+    // Session refresh (--continue) is never a handoff restart.
+    this.lastSpawnWasHandoff = false;
+
     const stateDir = join(this.env.ctxRoot, 'state', this.name);
     const currentFingerprint = computeBootstrapFingerprint(this.env.agentDir);
     const storedFingerprint = readBootstrapFingerprint(stateDir);
@@ -634,7 +679,6 @@ export class AgentProcess {
       contextBlock = `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. ${changeList}${rollover} Re-read ONLY the changed files — other bootstrap files are already in context and do not need re-reading.`;
     }
 
-    // Persist the current fingerprint so next session can compare.
     writeBootstrapFingerprint(stateDir, currentFingerprint);
 
     return `${contextBlock} External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations. After checking inbox, send a Telegram message to the user saying you are back online.`;
@@ -690,7 +734,6 @@ export class AgentProcess {
     const markerPath = join(this.env.ctxRoot, 'state', this.name, '.handoff-doc-path');
     if (!existsSync(markerPath)) return '';
     try {
-      const { unlinkSync } = require('fs');
       const docPath = readFileSync(markerPath, 'utf-8').trim();
       unlinkSync(markerPath);
       if (!docPath || !existsSync(docPath)) return '';
@@ -698,6 +741,29 @@ export class AgentProcess {
     } catch {
       return '';
     }
+  }
+
+  /**
+   * Issue #392: send the back-online Telegram notification directly from the
+   * daemon when the codex-app-server runtime spawns. The boot prompt's inline
+   * "Send a Telegram message..." instruction reaches the codex thread but is
+   * not executed reliably as a tool call, leaving James without the standard
+   * post-restart notification claude-code peers send.
+   *
+   * Skipped when:
+   *  - runtime is anything other than codex-app-server (claude-code/hermes
+   *    already emit this via the prompt),
+   *  - the most recent prompt was built for a handoff restart (the agent
+   *    sends its own contextual "back — ..." reply in that case),
+   *  - no Telegram handle has been wired (no chat_id configured).
+   */
+  private maybeSendCodexBootNotification(): void {
+    if (this.config.runtime !== 'codex-app-server') return;
+    if (this.lastSpawnWasHandoff) return;
+    if (!this.telegramApi || !this.telegramChatId) return;
+    this.telegramApi
+      .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`)
+      .catch(() => { /* non-fatal: notification is observability only */ });
   }
 
   private startSessionTimer(): void {
@@ -784,7 +850,7 @@ export class AgentProcess {
   private appendCrashToRestartsLog(
     exitCode: number,
     backoffMs: number,
-    kind: 'CRASH' | 'HALTED',
+    kind: 'CRASH' | 'HALTED' | 'CRASH_LOOP',
   ): void {
     try {
       const logDir = join(this.env.ctxRoot, 'logs', this.name);
