@@ -453,6 +453,7 @@ export class AgentManager {
           if (typeof fromId !== 'number' || !allowedIds.includes(fromId)) {
             const rejectedFrom = msg.from?.first_name || msg.from?.username || 'unknown';
             log(`Ignoring message from unauthorized user (allowed_user gate): from=${fromId} (${rejectedFrom})`);
+            // #459 reject-count watchdog: alert after N consecutive rejects (multi-user gate from #467 preserved).
             const entry = this.agents.get(name);
             if (entry) {
               entry.telegramRejectCount = (entry.telegramRejectCount ?? 0) + 1;
@@ -582,6 +583,7 @@ export class AgentManager {
           const fromId = reaction.user?.id;
           if (typeof fromId !== 'number' || !allowedIds.includes(fromId)) {
             log(`Ignoring reaction from unauthorized user (allowed_user gate): from=${fromId}`);
+            // #459 reject-count watchdog (multi-user gate from #467 preserved).
             const entry = this.agents.get(name);
             if (entry) {
               entry.telegramRejectCount = (entry.telegramRejectCount ?? 0) + 1;

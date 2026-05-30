@@ -335,6 +335,8 @@ function emitHookBusEvent(
     // so 'cortextos' fails ENOENT and hook audit events are silently dropped.
     // Invoke via process.execPath + the bundled dist/cli.js path (same pattern
     // as fast-checker.ts heartbeat watchdog) so PATH doesn't matter.
+    // CTX_FRAMEWORK_ROOT is set by the daemon at startup; if unset (rare — e.g.
+    // unit test), fall back to legacy PATH lookup so the test doesn't fail outright.
     const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
     if (frameworkRoot) {
       const cliPath = join(frameworkRoot, 'dist', 'cli.js');
