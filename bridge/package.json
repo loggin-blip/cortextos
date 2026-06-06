@@ -1,0 +1,17 @@
+{
+  "name": "cortextos-bridge",
+  "version": "0.1.0",
+  "description": "Cloud message broker mellom macbook Claude-sesjoner og cortextos-agenter på studio. Bruker Supabase som broker.",
+  "type": "module",
+  "main": "bridge.mjs",
+  "scripts": {
+    "start": "node bridge.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

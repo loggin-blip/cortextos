@@ -1,0 +1,19 @@
+{
+  "name": "massivlust-sync",
+  "version": "1.0.0",
+  "description": "Data sync system for Massivlust — Tripletex, Drive, IFC, Gmail → Supabase",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "backfill": "node src/index.js --mode=backfill",
+    "status": "./scripts/status.sh"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.0",
+    "dotenv": "^16.4.0",
+    "googleapis": "^146.0.0",
+    "node-cron": "^3.0.3",
+    "pino": "^9.6.0",
+    "pino-pretty": "^13.0.0"
+  }
+}
