@@ -209,6 +209,18 @@ export interface AgentConfig {
    * poller will be skipped regardless.
    */
   telegram_polling?: boolean;
+  /**
+   * Per-agent terminal-stream → Telegram mirror. When `enabled: true`, the
+   * daemon attaches a TerminalStreamer to the PTY's onData handler that
+   * forwards filtered terminal output (tool calls, errors, MCP issues,
+   * assistant text) to `chat_id`. Disabled by default — opt-in only.
+   * Toggle via `cortextos bus stream-toggle <agent> on|off`.
+   * Takes effect on next agent restart.
+   */
+  terminal_stream?: {
+    enabled: boolean;
+    chat_id: string;
+  };
 }
 
 export interface CronEntry {

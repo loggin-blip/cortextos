@@ -6,7 +6,8 @@ import { AgentPTY } from '../pty/agent-pty.js';
 import { CodexAppServerPTY } from '../pty/codex-app-server-pty.js';
 import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
 import { MessageDedup, injectMessage } from '../pty/inject.js';
-import type { TelegramAPI } from '../telegram/api.js';
+import { TerminalStreamer } from '../pty/terminal-stream.js';
+import { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
@@ -151,6 +152,12 @@ export class AgentProcess {
     if (this.config.runtime === 'codex-app-server' && this.telegramApi && this.telegramChatId) {
       (this.pty as CodexAppServerPTY).setTelegramHandle(this.telegramApi, this.telegramChatId);
     }
+
+    // Attach the terminal-stream → Telegram mirror when enabled in config.
+    // Only the Claude AgentPTY path is supported today — Hermes and
+    // codex-app-server use different telemetry surfaces. Opt-in per agent
+    // (config.terminal_stream.enabled). See src/pty/terminal-stream.ts.
+    this.maybeAttachTerminalStreamer();
 
     // BUG-011 fix: create a fresh exit signal for this run. resolveExit is
     // called from the onExit handler below; stop() awaits exitPromise to
@@ -908,6 +915,58 @@ export class AgentProcess {
     this.telegramApi
       .sendMessage(this.telegramChatId, `Agent ${this.name} is back online`)
       .catch(() => { /* non-fatal: notification is observability only */ });
+  }
+
+  /**
+   * Attach the optional terminal-stream → Telegram mirror to the current
+   * PTY based on `config.terminal_stream`. No-op when:
+   *   - the feature is disabled or unconfigured,
+   *   - this is not a Claude AgentPTY (hermes / codex-app-server skipped),
+   *   - the agent's .env has no BOT_TOKEN to send with,
+   *   - chat_id is empty.
+   *
+   * Called once per start(); the streamer is auto-disposed by AgentPTY.kill().
+   */
+  private maybeAttachTerminalStreamer(): void {
+    const cfg = this.config.terminal_stream;
+    if (!cfg?.enabled) return;
+    if (!cfg.chat_id || String(cfg.chat_id).trim() === '') {
+      this.log('terminal_stream enabled but chat_id is empty — skipping');
+      return;
+    }
+    // Only the Claude PTY path supports the streamer. Hermes / codex have
+    // their own telemetry surfaces we don't want to fight here.
+    if (!(this.pty instanceof AgentPTY)) return;
+
+    // Resolve BOT_TOKEN from agent .env (same precedence as send-telegram).
+    let botToken = '';
+    try {
+      const envFile = join(this.env.agentDir, '.env');
+      if (existsSync(envFile)) {
+        const content = readFileSync(envFile, 'utf-8');
+        const match = content.match(/^BOT_TOKEN=(.+)$/m);
+        if (match) botToken = match[1].trim();
+      }
+    } catch { /* fall through to process.env check */ }
+    if (!botToken) botToken = process.env.BOT_TOKEN ?? '';
+    if (!botToken) {
+      this.log('terminal_stream enabled but BOT_TOKEN not found in .env — skipping');
+      return;
+    }
+
+    try {
+      const api = new TelegramAPI(botToken);
+      const streamer = new TerminalStreamer(
+        api,
+        String(cfg.chat_id).trim(),
+        this.name,
+        (msg) => this.log(`terminal-stream: ${msg}`),
+      );
+      (this.pty as AgentPTY).setTerminalStreamer(streamer);
+      this.log(`terminal_stream attached → chat ${cfg.chat_id}`);
+    } catch (err) {
+      this.log(`terminal_stream attach failed (non-fatal): ${err}`);
+    }
   }
 
   private startSessionTimer(): void {

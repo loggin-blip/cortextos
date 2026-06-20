@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from 'fs';
 import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
+import type { TerminalStreamer } from './terminal-stream.js';
 
 // node-pty types
 interface IPty {
@@ -36,6 +37,13 @@ export class AgentPTY {
   private config: AgentConfig;
   private onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private spawnFn: SpawnFn | null = null;
+  /**
+   * Optional terminal-stream → Telegram mirror. When set, every PTY data
+   * chunk is forwarded (after secret redaction inside OutputBuffer) to the
+   * streamer. Observability-only — must never alter PTY state, must never
+   * throw into the data handler. See `src/pty/terminal-stream.ts`.
+   */
+  private streamer: TerminalStreamer | null = null;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string, bootstrapPattern?: string) {
     this.env = env;
@@ -156,6 +164,14 @@ export class AgentPTY {
     // Set up output capture
     this.pty.onData((data: string) => {
       this.outputBuffer.push(data);
+      // Fan out to the optional terminal stream — fire-and-forget. The
+      // streamer's push() is contract-bound to never throw, but we wrap
+      // defensively anyway so a streamer bug can never break PTY capture.
+      if (this.streamer) {
+        try {
+          this.streamer.push(data);
+        } catch { /* never propagate into the PTY data handler */ }
+      }
     });
 
     // Set up exit handler
@@ -299,6 +315,27 @@ export class AgentPTY {
       this.pty = null;
       pty.kill();
     }
+    // Tear down the terminal streamer if one was attached. Safe to call
+    // even when no streamer is set — dispose() is idempotent.
+    if (this.streamer) {
+      try { this.streamer.dispose(); } catch { /* swallow */ }
+      this.streamer = null;
+    }
+  }
+
+  /**
+   * Attach a TerminalStreamer that will receive every PTY data chunk for
+   * forwarding to Telegram. Pass `null` to detach. Idempotent — replacing
+   * an existing streamer disposes the old one first.
+   *
+   * Wiring lives in `AgentProcess.start()` which reads
+   * `config.terminal_stream` and constructs the streamer when enabled.
+   */
+  setTerminalStreamer(streamer: TerminalStreamer | null): void {
+    if (this.streamer && this.streamer !== streamer) {
+      try { this.streamer.dispose(); } catch { /* swallow */ }
+    }
+    this.streamer = streamer;
   }
 
   /**

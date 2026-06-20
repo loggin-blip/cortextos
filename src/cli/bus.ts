@@ -1074,6 +1074,82 @@ busCommand
   });
 
 busCommand
+  .command('stream-toggle')
+  .description("Toggle the terminal-stream → Telegram mirror for an agent (takes effect on next restart).")
+  .argument('<agent>', 'Agent name')
+  .argument('<state>', "'on' or 'off'")
+  .option('--chat-id <id>', 'Telegram chat to stream to (required for the first --on, or to switch chats)')
+  .action((agentName: string, state: string, opts: { chatId?: string }) => {
+    if (state !== 'on' && state !== 'off') {
+      console.error(`Invalid state '${state}'. Must be 'on' or 'off'.`);
+      process.exit(1);
+    }
+    try {
+      validateAgentName(agentName);
+    } catch (err) {
+      console.error(String(err));
+      process.exit(1);
+    }
+
+    // Locate the agent's config.json. Scan orgs/<org>/agents/<name>/ to find
+    // the right one — bus commands run from any cwd so we can't assume CTX_*
+    // points to the target agent.
+    const env = resolveEnv();
+    const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
+    const orgsDir = join(projectRoot, 'orgs');
+    let configPath: string | null = null;
+    if (existsSync(orgsDir)) {
+      try {
+        const { readdirSync } = require('fs');
+        for (const org of readdirSync(orgsDir)) {
+          const candidate = join(orgsDir, org, 'agents', agentName, 'config.json');
+          if (existsSync(candidate)) {
+            configPath = candidate;
+            break;
+          }
+        }
+      } catch { /* fall through */ }
+    }
+    if (!configPath) {
+      console.error(`Agent '${agentName}' config.json not found under ${orgsDir}.`);
+      process.exit(1);
+    }
+
+    // Read + mutate + atomic-write. Required: parse + roundtrip should
+    // preserve unrelated fields exactly.
+    const { atomicWriteSync } = require('../utils/atomic.js');
+    let config: any = {};
+    try {
+      config = JSON.parse(readFileSync(configPath, 'utf-8'));
+    } catch (err) {
+      console.error(`Failed to parse ${configPath}: ${err}`);
+      process.exit(1);
+    }
+
+    const existing = (config.terminal_stream ?? {}) as { enabled?: boolean; chat_id?: string };
+    if (state === 'on') {
+      const chatId = opts.chatId ?? existing.chat_id;
+      if (!chatId || String(chatId).trim() === '') {
+        console.error(
+          `Cannot enable: no chat_id set. Pass --chat-id <id> on first enable.`,
+        );
+        process.exit(1);
+      }
+      config.terminal_stream = { enabled: true, chat_id: String(chatId).trim() };
+    } else {
+      // 'off': preserve the chat_id so re-enabling later is one-flag.
+      config.terminal_stream = { enabled: false, chat_id: existing.chat_id ?? '' };
+    }
+
+    atomicWriteSync(configPath, JSON.stringify(config, null, 2));
+    const summary = state === 'on'
+      ? `enabled → chat ${config.terminal_stream.chat_id}`
+      : `disabled`;
+    console.log(`terminal_stream ${summary} for ${agentName}`);
+    console.log(`Note: takes effect on next agent restart. Use 'cortextos bus self-restart' or 'cortextos stop ${agentName} && cortextos start ${agentName}' to apply now.`);
+  });
+
+busCommand
   .command('create-approval')
   .description('Request human approval for a high-stakes action')
   .argument('<title>', 'What you are requesting approval for')
