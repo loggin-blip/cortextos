@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from 'fs';
 import { platform } from 'os';
 import type { AgentConfig, CtxEnv } from '../types/index.js';
 import { OutputBuffer } from './output-buffer.js';
+import type { TerminalStreamer } from './terminal-stream.js';
 
 // node-pty types
 interface IPty {
@@ -36,6 +37,13 @@ export class AgentPTY {
   private config: AgentConfig;
   private onExitHandler: ((exitCode: number, signal?: number) => void) | null = null;
   private spawnFn: SpawnFn | null = null;
+  /**
+   * Optional terminal-stream → Telegram mirror. When set, every PTY data
+   * chunk is forwarded (after secret redaction inside OutputBuffer) to the
+   * streamer. Observability-only — must never alter PTY state, must never
+   * throw into the data handler. See `src/pty/terminal-stream.ts`.
+   */
+  private streamer: TerminalStreamer | null = null;
 
   constructor(env: CtxEnv, config: AgentConfig, logPath?: string, bootstrapPattern?: string) {
     this.env = env;
@@ -156,6 +164,14 @@ export class AgentPTY {
     // Set up output capture
     this.pty.onData((data: string) => {
       this.outputBuffer.push(data);
+      // Fan out to the optional terminal stream — fire-and-forget. The
+      // streamer's push() is contract-bound to never throw, but we wrap
+      // defensively anyway so a streamer bug can never break PTY capture.
+      if (this.streamer) {
+        try {
+          this.streamer.push(data);
+        } catch { /* never propagate into the PTY data handler */ }
+      }
     });
 
     // Set up exit handler
@@ -193,7 +209,27 @@ export class AgentPTY {
    * Protected so HermesPTY can override to return 'hermes'.
    */
   protected getBinaryName(): string {
-    return platform() === 'win32' ? 'claude.cmd' : 'claude';
+    if (platform() !== 'win32') return 'claude';
+    // The Claude Code Windows installer historically shipped a `claude.cmd`
+    // shim alongside `claude.exe`. Newer installers (e.g. when claude lives
+    // under `~/.local/bin`) ship only `claude.exe` and have no `.cmd` shim.
+    // Hardcoding `claude.cmd` causes node-pty/ConPTY to fail with an empty
+    // "File not found" error before the agent ever boots.
+    //
+    // Probe PATH for whichever extension is present and prefer `.exe` —
+    // it spawns more cleanly under ConPTY than a `.cmd` wrapper, and matches
+    // what `where.exe claude` returns on current installs.
+    const pathDirs = (process.env.PATH || '').split(';').filter(Boolean);
+    for (const ext of ['.exe', '.cmd']) {
+      for (const dir of pathDirs) {
+        if (existsSync(join(dir, `claude${ext}`))) {
+          return `claude${ext}`;
+        }
+      }
+    }
+    // Neither found on PATH — fall back to the legacy default so the error
+    // message from node-pty surfaces a recognizable filename for debugging.
+    return 'claude.cmd';
   }
 
   /**
@@ -208,7 +244,24 @@ export class AgentPTY {
       args.push('--continue');
     }
 
-    args.push('--dangerously-skip-permissions');
+    // Skip Claude Code's permission system by default (back-compat: agents have
+    // historically run unattended). Set `dangerously_skip_permissions: false` in
+    // the agent config to KEEP the gate on — then Claude Code's PermissionRequest
+    // flow (and the hook-permission-telegram approval) actually engages. Without
+    // this flag the CLI override would suppress any settings.json permission mode.
+    // Only the literal boolean `false` disables the skip; warn on a non-boolean so
+    // a typo (e.g. the string "false") can't silently leave an agent ungated when
+    // the operator intended to engage the gate.
+    const skipPermissions = this.config.dangerously_skip_permissions;
+    if (skipPermissions !== undefined && typeof skipPermissions !== 'boolean') {
+      console.warn(
+        `[agent-pty] ${this.env.agentName}: dangerously_skip_permissions must be true or false ` +
+        `(got ${JSON.stringify(skipPermissions)}); defaulting to skip-on.`,
+      );
+    }
+    if (skipPermissions !== false) {
+      args.push('--dangerously-skip-permissions');
+    }
 
     if (this.config.model) {
       args.push('--model', this.config.model);
@@ -262,6 +315,27 @@ export class AgentPTY {
       this.pty = null;
       pty.kill();
     }
+    // Tear down the terminal streamer if one was attached. Safe to call
+    // even when no streamer is set — dispose() is idempotent.
+    if (this.streamer) {
+      try { this.streamer.dispose(); } catch { /* swallow */ }
+      this.streamer = null;
+    }
+  }
+
+  /**
+   * Attach a TerminalStreamer that will receive every PTY data chunk for
+   * forwarding to Telegram. Pass `null` to detach. Idempotent — replacing
+   * an existing streamer disposes the old one first.
+   *
+   * Wiring lives in `AgentProcess.start()` which reads
+   * `config.terminal_stream` and constructs the streamer when enabled.
+   */
+  setTerminalStreamer(streamer: TerminalStreamer | null): void {
+    if (this.streamer && this.streamer !== streamer) {
+      try { this.streamer.dispose(); } catch { /* swallow */ }
+    }
+    this.streamer = streamer;
   }
 
   /**
@@ -303,7 +377,14 @@ export class AgentPTY {
     const keepVars = [
       'PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'LANG', 'LC_ALL',
       'TMPDIR', 'TEMP', 'TMP', 'ANTHROPIC_API_KEY', 'CLAUDE_API_KEY',
-      'NODE_PATH', 'COMSPEC', 'SystemRoot', 'USERPROFILE',
+      'NODE_PATH', 'COMSPEC', 'USERPROFILE',
+      // Windows path-expansion essentials. Stripping these causes phantom
+      // %SystemDrive% directories from inherited Search Indexer processes
+      // and Unity batchmode UPM IPC crashes (path.join(undefined,...)).
+      'SystemDrive', 'SystemRoot', 'windir',
+      'APPDATA', 'LOCALAPPDATA', 'ProgramData', 'ALLUSERSPROFILE',
+      'ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432',
+      'HOMEDRIVE', 'HOMEPATH', 'PUBLIC',
     ];
     for (const key of keepVars) {
       if (process.env[key]) {

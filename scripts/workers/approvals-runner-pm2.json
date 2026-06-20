@@ -1,0 +1,21 @@
+{
+  "apps": [
+    {
+      "name": "approvals-runner",
+      "script": "/Users/max/cortextos/scripts/workers/approvals-runner.py",
+      "interpreter": "python3",
+      "autorestart": true,
+      "max_restarts": 10,
+      "restart_delay": 10000,
+      "watch": false,
+      "env": {
+        "APPROVALS_INTERVAL_SEC": "7200",
+        "TELEGRAM_CHAT_ID": "6447044389",
+        "TELEGRAM_BOT_TOKEN": "8536486806:AAGTlnxPhKiTxEsdYrjLlbXczGB8Wfz4qMc"
+      },
+      "error_file": "/Users/max/.cortextos/default/logs/approvals-runner/stderr.log",
+      "out_file": "/Users/max/.cortextos/default/logs/approvals-runner/stdout.log",
+      "merge_logs": true
+    }
+  ]
+}

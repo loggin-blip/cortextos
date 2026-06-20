@@ -120,7 +120,7 @@ export default function ApprovalsPage() {
     <div className="space-y-4">
       <h1 className="text-2xl font-semibold">Approvals</h1>
 
-      <Tabs defaultValue={humanTasks.length > 0 ? 'human' : 'pending'}>
+      <Tabs defaultValue="pending">
         <TabsList>
           <TabsTrigger value="human">
             <IconUser size={14} className="mr-1" />

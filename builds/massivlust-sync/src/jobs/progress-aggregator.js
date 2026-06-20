@@ -1,0 +1,95 @@
+import { supabase } from '../supabase.js';
+import * as syncRuns from '../sync-runs.js';
+import { logger } from '../logger.js';
+
+export async function run({ dryRun = false } = {}) {
+  const runId = await syncRuns.start({ source: 'progress_aggregator' });
+
+  try {
+    const { data: projects } = await supabase
+      .from('massivlust_projects')
+      .select('id, name')
+      .eq('status', 'active');
+
+    if (!projects?.length) {
+      await syncRuns.complete(runId, { status: 'success', rows_in: 0, rows_upserted: 0 });
+      return { upserted: 0, total: 0 };
+    }
+
+    let upserted = 0, failed = 0;
+
+    for (const project of projects) {
+      try {
+        const { data: prepData } = await supabase.rpc('exec_sql', {
+          query: `SELECT
+            COUNT(*) FILTER (WHERE status='done')::numeric / NULLIF(COUNT(*),0) * 100 as prep_progress
+          FROM massivlust_project_checklist_items
+          WHERE project_id = '${project.id}' AND phase IN ('T-8','T-6','T-4','T-2','T-1','T-0')`
+        }).single();
+
+        const { data: execData } = await supabase
+          .from('massivlust_prosjekt_elementer')
+          .select('status', { count: 'exact' })
+          .eq('project_id', project.id);
+
+        const totalElements = execData?.length || 0;
+        const mountedElements = (execData || []).filter(e => e.status === 'solvet').length;
+        const executionRaw = totalElements > 0 ? (mountedElements / totalElements) * 100 : 0;
+
+        const { count: openAvvik } = await supabase
+          .from('massivlust_avvik')
+          .select('id', { count: 'exact', head: true })
+          .eq('project_id', project.id)
+          .in('status', ['aapen', 'i_arbeid']);
+
+        const qualityPenalty = Math.min((openAvvik || 0) * 2, 30);
+        const executionProgress = executionRaw * (1 - qualityPenalty / 100);
+        const prepProgress = prepData?.prep_progress ?? 0;
+
+        const breakdown = {
+          total_elements: totalElements,
+          mounted_elements: mountedElements,
+          execution_raw: Math.round(executionRaw * 10) / 10,
+          open_avvik: openAvvik || 0,
+          quality_penalty: qualityPenalty,
+          computed_at: new Date().toISOString(),
+        };
+
+        if (dryRun) {
+          logger.info({ project: project.name, prepProgress, executionProgress, breakdown }, 'DRY-RUN');
+          upserted++;
+          continue;
+        }
+
+        const { error } = await supabase
+          .from('massivlust_projects')
+          .update({
+            computed_prep_progress: Math.round(prepProgress * 10) / 10,
+            computed_execution_progress: Math.round(executionProgress * 10) / 10,
+            computed_quality_penalty: qualityPenalty,
+            computed_progress_breakdown: breakdown,
+          })
+          .eq('id', project.id);
+
+        if (error) throw error;
+        upserted++;
+        logger.info({ project: project.name, prepProgress: Math.round(prepProgress), executionProgress: Math.round(executionProgress) }, 'Progress updated');
+      } catch (err) {
+        failed++;
+        logger.error({ err, project: project.name }, 'Progress aggregation failed');
+      }
+    }
+
+    await syncRuns.complete(runId, {
+      status: failed === 0 ? 'success' : 'partial',
+      rows_in: projects.length,
+      rows_upserted: upserted,
+      rows_failed: failed,
+    });
+
+    return { upserted, failed, total: projects.length };
+  } catch (err) {
+    await syncRuns.complete(runId, { status: 'error', error_message: err.message });
+    throw err;
+  }
+}

@@ -40,6 +40,7 @@ ${APPDATA}/
 knowledge-base/venv/
 knowledge-base/__pycache__/
 knowledge-base/scripts/__pycache__/
+knowledge-base/scripts/_test_clients/__pycache__/
 tests/playwright/dashboard-ui.spec.ts
 
 # Local ops docs (personal, not for public repo)
@@ -53,3 +54,14 @@ BRAINDUMP*.md
 AGENTS.md
 dashboard/screenshots/
 dashboard/test-*.py
+
+# Agent/org secrets
+orgs/*/secrets/
+orgs/*/secrets.*
+**/wda-fleet-agent-key.json
+**/*-key.json
+
+# Public community agent templates may intentionally include their own docs,
+# AGENTS.md, memory skill, and scaffold files.
+!community/agents/research-agent/
+!community/agents/research-agent/**

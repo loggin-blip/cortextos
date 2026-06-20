@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, findTaskFile } from '../../../src/bus/task';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, findTaskFile, archiveTasks } from '../../../src/bus/task';
 import type { BusPaths } from '../../../src/types';
 
 describe('Task Management', () => {
@@ -29,6 +29,36 @@ describe('Task Management', () => {
     rmSync(testDir, { recursive: true, force: true });
   });
 
+  describe('path-traversal hardening (#13/#14)', () => {
+    it('findTaskFile rejects a traversal task id', () => {
+      expect(() => findTaskFile(paths, '../../etc/passwd')).toThrow(/Invalid task id/);
+      expect(() => findTaskFile(paths, 'task/../../secrets')).toThrow(/Invalid task id/);
+      expect(() => findTaskFile(paths, 'task_1.json')).toThrow(/Invalid task id/);
+    });
+
+    it('readTaskAudit rejects a traversal task id', () => {
+      expect(() => readTaskAudit(paths, '../../../etc/shadow')).toThrow(/Invalid task id/);
+    });
+
+    it('findTaskFile still resolves a legitimate task', () => {
+      const id = createTask(paths, 'paul', 'acme', 'T', { assignee: 'boris' });
+      expect(findTaskFile(paths, id)).toContain(`${id}.json`);
+    });
+
+    it('archiveTasks skips a task whose JSON id is tampered with traversal (no escape)', () => {
+      mkdirSync(paths.taskDir, { recursive: true });
+      // Safe filename, but the internal id carries traversal that would resolve
+      // to testDir/escaped.json (outside the task tree) on archive write/rename.
+      writeFileSync(join(paths.taskDir, 'task_evil_1.json'), JSON.stringify({
+        id: '../escaped', status: 'completed', completed_at: '2020-01-01T00:00:00Z',
+        assigned_to: 'boris', org: 'acme',
+      }));
+      expect(() => archiveTasks(paths)).not.toThrow();
+      // The guard must have prevented the out-of-tree write.
+      expect(existsSync(join(testDir, 'escaped.json'))).toBe(false);
+    });
+  });
+
   describe('createTask', () => {
     it('creates task with correct JSON format', () => {
       const taskId = createTask(paths, 'paul', 'acme', 'Build landing page', {
@@ -37,7 +67,7 @@ describe('Task Management', () => {
         priority: 'high',
       });
 
-      expect(taskId).toMatch(/^task_\d+_\d{3}$/);
+      expect(taskId).toMatch(/^task_\d+_\d{8}$/);
 
       const content = JSON.parse(readFileSync(join(paths.taskDir, `${taskId}.json`), 'utf-8'));
 
@@ -81,6 +111,32 @@ describe('Task Management', () => {
       expect(content.status).toBe('completed');
       expect(content.completed_at).toBeTruthy();
       expect(content.result).toBe('Landing page done, committed at abc123');
+    });
+
+    it('emits a task/task_completed activity event for the assignee', () => {
+      const taskId = createTask(paths, 'paul', 'acme', 'Complete-event task', {
+        assignee: 'boris',
+      });
+      completeTask(paths, taskId, 'shipped');
+
+      // Event file: <analyticsDir>/events/boris/<YYYY-MM-DD>.jsonl
+      const today = new Date().toISOString().split('T')[0];
+      const eventFile = join(paths.analyticsDir, 'events', 'boris', `${today}.jsonl`);
+      expect(existsSync(eventFile)).toBe(true);
+
+      const events = readFileSync(eventFile, 'utf-8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      const completedEvents = events.filter((e) => e.event === 'task_completed');
+      expect(completedEvents).toHaveLength(1);
+      const evt = completedEvents[0];
+      expect(evt.agent).toBe('boris');
+      expect(evt.org).toBe('acme');
+      expect(evt.category).toBe('task');
+      expect(evt.severity).toBe('info');
+      expect(evt.metadata.task_id).toBe(taskId);
+      expect(evt.metadata.result).toBe('shipped');
     });
   });
 
