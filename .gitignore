@@ -77,3 +77,6 @@ builds/*/secrets/
 /agent-engine/node_modules/
 **/node_modules/
 agent-engine/node_modules
+
+# Leaked internal ops report - never re-track (removed 2026-07-01)
+WINDOWS_INSTALL_REPORT.md
