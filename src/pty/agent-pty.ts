@@ -263,9 +263,8 @@ export class AgentPTY {
       args.push('--dangerously-skip-permissions');
     }
 
-    if (this.config.model) {
-      args.push('--model', this.config.model);
-    }
+    const DEFAULT_MODEL = 'claude-sonnet-4-6';
+    args.push('--model', this.config.model || DEFAULT_MODEL);
 
     // Local override pattern (feat #20): concatenate {agentDir}/local/*.md files
     // and append as system prompt. The local/ dir is gitignored so users can customize

@@ -19,6 +19,14 @@ import {
   IconTarget,
   IconMessages,
   IconNotes,
+  IconFolder,
+  IconUsers,
+  IconPhoto,
+  IconCoin,
+  IconUser,
+  IconVideo,
+  IconTerminal2,
+  IconMail,
 } from '@tabler/icons-react';
 import { cn } from '@/lib/utils';
 import { Badge } from '@/components/ui/badge';
@@ -32,31 +40,71 @@ interface NavItem {
   section?: string;
 }
 
-const navItems: NavItem[] = [
-  // Core
+const wdaNavItems: NavItem[] = [
+  { label: 'Mission Control', href: '/', icon: IconLayoutDashboard, section: 'core' },
+  { label: 'Prosjekter', href: '/prosjekter', icon: IconFolder, section: 'core' },
+  { label: 'Agenter', href: '/agents', icon: IconRobot, section: 'core' },
+  { label: 'Tasks', href: '/tasks', icon: IconListCheck, section: 'core' },
+  { label: 'Activity', href: '/activity', icon: IconActivity, section: 'core' },
+
+  { label: 'Comms', href: '/comms', icon: IconMessages, section: 'ops' },
+  { label: 'Approvals', href: '/approvals', icon: IconShieldCheck, section: 'ops' },
+  { label: 'Analytics', href: '/analytics', icon: IconChartDots3, section: 'ops' },
+  { label: 'Content', href: '/content', icon: IconVideo, section: 'ops' },
+
+  { label: 'Knowledge Base', href: '/knowledge-base', icon: IconBook2, section: 'intel' },
+  { label: 'Skills', href: '/skills', icon: IconPuzzle, section: 'intel' },
+  { label: 'Claude', href: '/claude', icon: IconTerminal2, section: 'intel' },
+];
+
+const massivlustNavItems: NavItem[] = [
+  { label: 'Dashboard', href: '/massivlust', icon: IconLayoutDashboard, section: 'core' },
+  { label: 'Prosjekter', href: '/massivlust/prosjekter', icon: IconFolder, section: 'core' },
+  { label: 'Team', href: '/massivlust/team', icon: IconUsers, section: 'core' },
+  { label: 'KS-oversikt', href: '/massivlust/ks', icon: IconPhoto, section: 'core' },
+  { label: 'Økonomi', href: '/massivlust/okonomi', icon: IconCoin, section: 'core' },
+  { label: 'E-postutkast', href: '/massivlust/utkast', icon: IconMail, section: 'core' },
+  { label: 'Min side', href: '/massivlust/min-side', icon: IconUser, section: 'personal' },
+];
+
+const nordfloNavItems: NavItem[] = [
+  { label: 'Dashboard', href: '/nordflo', icon: IconLayoutDashboard, section: 'core' },
+  { label: 'Pipeline', href: '/nordflo/pipeline', icon: IconTarget, section: 'core' },
+  { label: 'Analytics', href: '/nordflo/analytics', icon: IconChartDots3, section: 'core' },
+];
+
+const allNavItems: NavItem[] = [
   { label: 'Overview', href: '/', icon: IconLayoutDashboard, section: 'core' },
   { label: 'Agents', href: '/agents', icon: IconRobot, section: 'core' },
   { label: 'Tasks', href: '/tasks', icon: IconListCheck, section: 'core' },
   { label: 'Activity', href: '/activity', icon: IconActivity, section: 'core' },
 
-  // Operations
   { label: 'Comms', href: '/comms', icon: IconMessages, section: 'ops' },
   { label: 'Approvals', href: '/approvals', icon: IconShieldCheck, section: 'ops' },
   { label: 'Workflows', href: '/workflows', icon: IconClock, section: 'ops' },
   { label: 'Strategy', href: '/strategy', icon: IconTarget, section: 'ops' },
   { label: 'Analytics', href: '/analytics', icon: IconChartDots3, section: 'ops' },
 
-  // Intelligence
   { label: 'Knowledge Base', href: '/knowledge-base', icon: IconBook2, section: 'intel' },
   { label: 'Wiki', href: '/wiki', icon: IconNotes, section: 'intel' },
   { label: 'Experiments', href: '/experiments', icon: IconFlask, section: 'intel' },
   { label: 'Skills', href: '/skills', icon: IconPuzzle, section: 'intel' },
 ];
 
+function getNavItems(org: string): NavItem[] {
+  switch (org) {
+    case 'westside-hq': return wdaNavItems;
+    case 'massivlust': return massivlustNavItems;
+    case 'nordflo': return nordfloNavItems;
+    default: return allNavItems;
+  }
+}
+
 const sectionLabels: Record<string, string> = {
   core: '',
   ops: 'Operations',
   intel: 'Intelligence',
+  personal: 'Personlig',
 };
 
 interface SidebarProps {
@@ -74,6 +122,8 @@ export function Sidebar({
 }: SidebarProps) {
   const pathname = usePathname();
   const { currentOrg } = useOrg();
+
+  const navItems = getNavItems(currentOrg);
 
   function orgHref(href: string) {
     if (currentOrg && currentOrg !== 'all') {
@@ -93,8 +143,7 @@ export function Sidebar({
     return 0;
   }
 
-  // Group items by section
-  const sections = ['core', 'ops', 'intel'];
+  const sections = [...new Set(navItems.map(i => i.section || 'core'))];
 
   return (
     <aside className="flex h-screen w-56 shrink-0 flex-col border-r bg-card/50">

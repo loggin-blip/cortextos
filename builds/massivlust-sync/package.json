@@ -9,6 +9,7 @@
     "status": "./scripts/status.sh"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.104.2",
     "@supabase/supabase-js": "^2.49.0",
     "dotenv": "^16.4.0",
     "googleapis": "^146.0.0",

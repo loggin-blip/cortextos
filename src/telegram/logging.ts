@@ -7,7 +7,99 @@
 import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { logEvent } from '../bus/event.js';
+import { resolveEnv } from '../utils/env.js';
+import { sourceEnvFile } from '../utils/env.js';
 import type { BusPaths, TelegramMessage } from '../types/index.js';
+
+/**
+ * Lazy-load SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY from cortextOS env files
+ * if they are not already present in process.env. This makes the mirror work
+ * both inside an agent-PTY (where secrets.env is already sourced) and from a
+ * bare `cortextos bus send-telegram` CLI call (where it is not).
+ *
+ * Search order (first match wins, but does not override existing process.env):
+ *   1. {frameworkRoot}/.env             (shared root .env)
+ *   2. {frameworkRoot}/orgs/{org}/secrets.env  (per-org shared secrets)
+ */
+function ensureSupabaseEnvLoaded(): void {
+  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) return;
+  try {
+    const env = resolveEnv();
+    if (env.frameworkRoot) {
+      sourceEnvFile(join(env.frameworkRoot, '.env'));
+    }
+    if (env.frameworkRoot && env.org) {
+      sourceEnvFile(join(env.frameworkRoot, 'orgs', env.org, 'secrets.env'));
+    }
+  } catch { /* never throw — mirror is best-effort */ }
+}
+
+/**
+ * Mirror a Telegram message (inbound or outbound) to the Supabase
+ * `massivlust_agent_messages` table for live dashboard sync.
+ *
+ * Best-effort: never throws, never blocks the send path. Uses Supabase REST
+ * API directly via fetch (no SDK dependency — keeps Cortex runtime slim).
+ *
+ * Skips silently if SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY are not set,
+ * or if the chat_id is not mapped to an employee in
+ * `massivlust_telegram_chat_map`.
+ */
+export async function mirrorToSupabase(params: {
+  chatId: string | number;
+  agentName: string;
+  direction: 'inbound' | 'outbound';
+  text: string;
+  messageId?: number;
+  metadata?: Record<string, unknown>;
+}): Promise<void> {
+  ensureSupabaseEnvLoaded();
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) return;
+
+  const chatIdNum = Number(params.chatId);
+  if (!Number.isFinite(chatIdNum)) return;
+
+  try {
+    // 1. Look up employee_id from telegram_chat_id
+    const mapRes = await fetch(
+      `${url}/rest/v1/massivlust_telegram_chat_map?select=employee_id&telegram_chat_id=eq.${chatIdNum}&active=eq.true&limit=1`,
+      {
+        headers: {
+          apikey: key,
+          Authorization: `Bearer ${key}`,
+        },
+      },
+    );
+    if (!mapRes.ok) return;
+    const mappingRows = (await mapRes.json()) as Array<{ employee_id: string }>;
+    const employeeId = mappingRows?.[0]?.employee_id;
+    if (!employeeId) return; // chat not linked — skip
+
+    // 2. Insert message row
+    await fetch(`${url}/rest/v1/massivlust_agent_messages`, {
+      method: 'POST',
+      headers: {
+        apikey: key,
+        Authorization: `Bearer ${key}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: JSON.stringify({
+        employee_id: employeeId,
+        agent_id: params.agentName,
+        direction: params.direction,
+        text: params.text,
+        telegram_chat_id: chatIdNum,
+        telegram_msg_id: params.messageId ?? null,
+        metadata: params.metadata ?? {},
+      }),
+    });
+  } catch {
+    // Never throw — mirror must not break message processing
+  }
+}
 
 /**
  * Optional metadata attached to an outbound Telegram message log entry.
@@ -52,6 +144,16 @@ export function logOutboundMessage(
   });
 
   appendFileSync(join(logDir, 'outbound-messages.jsonl'), entry + '\n', 'utf-8');
+
+  // Mirror to Supabase for dashboard live-sync. Best-effort, fire-and-forget.
+  mirrorToSupabase({
+    chatId,
+    agentName,
+    direction: 'outbound',
+    text,
+    messageId,
+    metadata: meta,
+  }).catch(() => { /* swallow — already logged inside */ });
 }
 
 /**
@@ -117,6 +219,18 @@ export function recordInboundTelegram(
   } catch (err) {
     log?.(`logEvent(telegram_received) failed: ${err}`);
   }
+
+  // Mirror to Supabase for dashboard live-sync. Best-effort.
+  if (msg.chat?.id !== undefined) {
+    mirrorToSupabase({
+      chatId: msg.chat.id,
+      agentName,
+      direction: 'inbound',
+      text,
+      messageId: msg.message_id,
+      metadata: { from_name: fromName, has_media: hasMedia },
+    }).catch(() => { /* swallow */ });
+  }
 }
 
 /**
@@ -168,6 +282,7 @@ export function buildRecentHistory(
   agentName: string,
   chatId: string | number,
   limit: number = 6,
+  excludeInboundText?: string,
 ): string | null {
   const logDir = join(ctxRoot, 'logs', agentName);
   const inboundPath = join(logDir, 'inbound-messages.jsonl');
@@ -202,6 +317,22 @@ export function buildRecentHistory(
   if (entries.length === 0) return null;
 
   entries.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+
+  // Drop the trailing inbound entry if it matches the message we're about to
+  // inject — otherwise the user sees their current message echoed inside
+  // "[Recent conversation:]" AND as the new "[user]:" line below it.
+  if (excludeInboundText) {
+    const trimmedExclude = excludeInboundText.trim();
+    while (entries.length > 0) {
+      const last = entries[entries.length - 1];
+      if (last.text === trimmedExclude) {
+        entries.pop();
+      } else {
+        break;
+      }
+    }
+  }
+
   const recent = entries.slice(-limit);
 
   const formatted = recent.map(e => {

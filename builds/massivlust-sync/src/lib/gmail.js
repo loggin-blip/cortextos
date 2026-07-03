@@ -2,10 +2,11 @@ import { google } from 'googleapis';
 import { readFileSync } from 'fs';
 import { config } from '../config.js';
 
-let _gmail = null;
+const _clients = new Map();
 
-function getClient() {
-  if (_gmail) return _gmail;
+function getClient(impersonateEmail) {
+  const email = impersonateEmail || config.google.impersonateEmail;
+  if (_clients.has(email)) return _clients.get(email);
 
   const keyFile = JSON.parse(readFileSync(config.google.saKeyPath, 'utf8'));
   const auth = new google.auth.JWT(
@@ -13,14 +14,15 @@ function getClient() {
     null,
     keyFile.private_key,
     ['https://www.googleapis.com/auth/gmail.modify'],
-    config.google.impersonateEmail,
+    email,
   );
-  _gmail = google.gmail({ version: 'v1', auth });
-  return _gmail;
+  const client = google.gmail({ version: 'v1', auth });
+  _clients.set(email, client);
+  return client;
 }
 
-export async function listHistory(startHistoryId) {
-  const gmail = getClient();
+export async function listHistory(startHistoryId, impersonateEmail) {
+  const gmail = getClient(impersonateEmail);
   const messages = [];
   let pageToken = null;
 
@@ -44,8 +46,8 @@ export async function listHistory(startHistoryId) {
   return { messages, historyId: messages.length > 0 ? undefined : startHistoryId };
 }
 
-export async function getMessage(messageId) {
-  const gmail = getClient();
+export async function getMessage(messageId, impersonateEmail) {
+  const gmail = getClient(impersonateEmail);
   const res = await gmail.users.messages.get({
     userId: 'me',
     id: messageId,
@@ -54,8 +56,8 @@ export async function getMessage(messageId) {
   return res.data;
 }
 
-export async function getProfile() {
-  const gmail = getClient();
+export async function getProfile(impersonateEmail) {
+  const gmail = getClient(impersonateEmail);
   const res = await gmail.users.getProfile({ userId: 'me' });
   return res.data;
 }
@@ -89,8 +91,48 @@ export function extractBody(payload) {
   return '';
 }
 
-export async function searchMessages(query, maxResults = 100) {
-  const gmail = getClient();
+export async function getAttachment(messageId, attachmentId, impersonateEmail) {
+  const gmail = getClient(impersonateEmail);
+  const res = await gmail.users.messages.attachments.get({
+    userId: 'me',
+    messageId,
+    id: attachmentId,
+  });
+  return Buffer.from(res.data.data, 'base64');
+}
+
+const SIGNATURE_IMAGE_RX = /^image\d*\.(png|jpe?g|gif|bmp)$/i;
+
+export function findAttachments(payload) {
+  const out = [];
+  function walk(part) {
+    if (!part) return;
+    const filename = part.filename || '';
+    const disposition = (part.headers || []).find(h => h.name.toLowerCase() === 'content-disposition')?.value || '';
+    const contentId = (part.headers || []).find(h => h.name.toLowerCase() === 'content-id')?.value || '';
+    const mimeType = part.mimeType || '';
+    const size = part.body?.size || 0;
+    const isInline = disposition.toLowerCase().startsWith('inline');
+    const isSignatureImage = mimeType.startsWith('image/') && SIGNATURE_IMAGE_RX.test(filename) && size < 100 * 1024;
+    const hasContentIdRef = !!contentId && size < 200 * 1024 && mimeType.startsWith('image/');
+    const isRealAttachment = filename && part.body?.attachmentId && !isInline && !isSignatureImage && !hasContentIdRef;
+    if (isRealAttachment) {
+      out.push({
+        partId: part.partId,
+        filename,
+        mimeType: mimeType || 'application/octet-stream',
+        sizeBytes: size,
+        attachmentId: part.body.attachmentId,
+      });
+    }
+    for (const sub of (part.parts || [])) walk(sub);
+  }
+  walk(payload);
+  return out;
+}
+
+export async function searchMessages(query, maxResults = 100, impersonateEmail) {
+  const gmail = getClient(impersonateEmail);
   const messages = [];
   let pageToken = null;
 

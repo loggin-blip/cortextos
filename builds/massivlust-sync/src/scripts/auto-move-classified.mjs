@@ -9,6 +9,12 @@ const ALEX_EMAIL = 'alex@massivlust.no';
 const MIN_CONFIDENCE = 0.92;
 const BATCH_LIMIT = 100;
 
+// VG54: always use canonical folder A, never touch old folder B (1uveyJJtc...)
+const FOLDER_OVERRIDES = {
+  'cd0c96aa-dfad-43ff-a34d-8cb7b65d2438': '10H0_XR44h4jLy9nYQqnCdvImO4oezDGn', // Verksgata 54
+};
+const VG54_FORBIDDEN = '1uveyJJtcVU6koVijosOEOYWPoqN3oWKe';
+
 const delay = (ms) => new Promise(r => setTimeout(r, ms));
 
 function makeDrive() {
@@ -33,13 +39,27 @@ async function findSubfolder(drive, parentId, subName) {
   return res.data.files?.[0]?.id || null;
 }
 
+async function getCurrentParent(drive, fileId) {
+  const r = await drive.files.get({ fileId, supportsAllDrives: true, fields: 'parents' });
+  return r.data.parents?.[0] || null;
+}
+
 async function moveFile(drive, fileId, fromFolderId, toFolderId) {
-  await drive.files.update({
+  if (!fileId) throw new Error('drive_file_id is null — refusing to move');
+  // If we don't know current parent, look it up — required for shared drive (exactly one parent rule)
+  const removeParent = fromFolderId || await getCurrentParent(drive, fileId);
+  const res = await drive.files.update({
     fileId,
     addParents: toFolderId,
-    removeParents: fromFolderId || undefined,
+    removeParents: removeParent || undefined,
     supportsAllDrives: true,
+    fields: 'id, parents',
   });
+  // Verify the file is actually in the destination
+  if (!res.data.parents?.includes(toFolderId)) {
+    throw new Error(`Move unconfirmed: file ${fileId} parents=${JSON.stringify(res.data.parents)}`);
+  }
+  return res.data;
 }
 
 async function main() {
@@ -87,12 +107,22 @@ async function main() {
       continue;
     }
 
+    // Apply folder overrides (VG54 canonical root)
+    const rootFolderId = FOLDER_OVERRIDES[file.v2_project_id] || project.drive_root_folder_id;
+
+    // Safety: never move into the forbidden old VG54 folder
+    if (rootFolderId === VG54_FORBIDDEN) {
+      console.warn(`  [SKIP-FORBIDDEN] ${file.file_name} — would target old VG54 folder`);
+      skipped++;
+      continue;
+    }
+
     const subName = pickSubfolder(file);
-    const cacheKey = `${project.drive_root_folder_id}/${subName}`;
+    const cacheKey = `${rootFolderId}/${subName}`;
 
     let targetFolderId = subfolderCache.get(cacheKey);
     if (!targetFolderId) {
-      targetFolderId = await findSubfolder(drive, project.drive_root_folder_id, subName);
+      targetFolderId = await findSubfolder(drive, rootFolderId, subName);
       if (targetFolderId) subfolderCache.set(cacheKey, targetFolderId);
     }
 
@@ -102,9 +132,17 @@ async function main() {
       continue;
     }
 
+    // Hard fail on null drive_file_id — never attempt move without it
+    if (!file.drive_file_id) {
+      console.warn(`  [SKIP-NULL-ID] ${file.file_name} — drive_file_id is null`);
+      skipped++;
+      continue;
+    }
+
     try {
       await moveFile(drive, file.drive_file_id, file.current_drive_folder_id, targetFolderId);
 
+      // Write audit and update status ONLY after confirmed Drive move
       await supabase.from('massivlust_unclassified_files')
         .update({ drive_destination_id: targetFolderId, status: 'moved' })
         .eq('id', file.id);
@@ -112,15 +150,12 @@ async function main() {
       const reason = file.v2_suggestions?.reasoning || null;
       await supabase.from('massivlust_audit_moves').insert({
         file_id: file.id,
-        drive_file_id: file.drive_file_id,
+        file_name: file.file_name,
         from_folder_id: file.current_drive_folder_id,
         to_folder_id: targetFolderId,
-        to_subfolder: subName,
         ai_confidence: file.v2_confidence,
         ai_model: 'sonnet-4-6',
         ai_reason: reason,
-        project_id: file.v2_project_id,
-        project_name: project.name,
       });
 
       moved++;

@@ -549,7 +549,7 @@ export class AgentManager {
         // Build reply context from the replied-to message.
         const replyToText = buildReplyContext(msg.reply_to_message);
 
-        const recentHistory = buildRecentHistory(this.ctxRoot, name, effectiveChatId, 6) ?? undefined;
+        const recentHistory = buildRecentHistory(this.ctxRoot, name, effectiveChatId, 6, text) ?? undefined;
         const formatted = FastChecker.formatTelegramTextMessage(
           from,
           effectiveChatId,

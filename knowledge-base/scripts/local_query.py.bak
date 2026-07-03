@@ -1,0 +1,31 @@
+import sys, json, urllib.request, pathlib, chromadb, argparse
+
+def embed(t):
+    req=urllib.request.Request("http://localhost:11434/api/embed",
+        data=json.dumps({"model":"bge-m3","input":t[:8000]}).encode(),
+        headers={"content-type":"application/json"})
+    with urllib.request.urlopen(req,timeout=120) as r: return json.loads(r.read())["embeddings"][0]
+
+p = argparse.ArgumentParser()
+p.add_argument('question')
+p.add_argument('--db-path', default=str(pathlib.Path.home()/".mmrag"/"chromadb"))
+p.add_argument('--collection', default='massivlust-docs')
+p.add_argument('--n-results', type=int, default=15)
+args = p.parse_args()
+
+c=chromadb.PersistentClient(path=args.db_path)
+try:
+    col=c.get_collection(args.collection)
+except Exception:
+    print(json.dumps({"results":[]}))
+    sys.exit(0)
+
+if col.count() == 0:
+    print(json.dumps({"results":[]}))
+    sys.exit(0)
+
+res=col.query(query_embeddings=[embed(args.question)], n_results=args.n_results, include=["documents","metadatas","distances"])
+out=[]
+for d,m,dist in zip(res["documents"][0],res["metadatas"][0],res["distances"][0]):
+    out.append({"filename":(m or {}).get("filename",""),"content":d or "","similarity":round(1-dist,4),"type":(m or {}).get("type","text")})
+print(json.dumps({"results":out}))

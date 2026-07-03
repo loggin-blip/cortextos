@@ -18,7 +18,7 @@ const allowedDevOrigins = (process.env.DASHBOARD_ALLOWED_DEV_ORIGINS ?? '')
 
 const nextConfig: NextConfig = {
   serverExternalPackages: ['better-sqlite3'],
-  ...(allowedDevOrigins.length > 0 && { allowedDevOrigins }),
+...(allowedDevOrigins.length > 0 && { allowedDevOrigins }),
   async headers() {
     return [
       {

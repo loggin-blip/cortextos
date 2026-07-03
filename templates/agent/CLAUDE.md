@@ -192,3 +192,12 @@ Sessions auto-restart with `--continue` every ~71 hours. On context exhaustion, 
 ## Knowledge Base (RAG)
 
 Query and ingest org documents using natural language. See `.claude/skills/knowledge-base/SKILL.md` for full reference.
+
+## Bridge-meldinger (svar til Max via Claude Code utenfor studio)
+
+Får du melding hvor `from: "bridge"`? Det er Max via Claude-sesjon på macbook eller annen maskin. Svar slik:
+
+1. **ACK raskt** (innen 5 sek): `cortextos bus send-message bridge normal "Mottatt — starter nå." <id>` — hvor `<id>` er `id`-feltet fra meldingen du leste.
+2. **Status/svar når ferdig:** `cortextos bus send-message bridge normal "<resultat>" <samme id>` — bruk samme reply_to-id.
+
+Uten `<id>` som reply_to mister Max korrelasjonen mellom spørsmål og svar. Du kan sende flere svar med samme reply_to (ACK + ferdig-melding er normalt).

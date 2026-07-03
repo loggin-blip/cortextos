@@ -1,0 +1,483 @@
+/**
+ * Opus reclassification of needs_review backlog.
+ * Priority (bridge reorder): PDF/text → other → images (deterministic GPS, no Opus tokens)
+ *
+ * PDF/other: Opus reads actual content via claude --print
+ * Images: deterministic pipeline —
+ *   1. "Google Foto/Skybaserte" path → personal (99% accurate, free)
+ *   2. Folder path fuzzy-matches project name → classified
+ *   3. GPS + Haversine vs Nominatim-geocoded project addresses → classified/project_id
+ *   4. No signal → stay needs_review
+ *
+ * Hard stop: 06:00 Oslo wall-clock guard
+ * Fixes v2_model logging bug: sends model='claude-opus-4-8' explicitly
+ * Source: pipeline_opus_backlog_jun15
+ */
+import 'dotenv/config';
+import { google } from 'googleapis';
+import { readFileSync, writeFileSync, unlinkSync, appendFileSync, existsSync } from 'fs';
+import { createClient } from '@supabase/supabase-js';
+import { execSync } from 'child_process';
+import { tmpdir } from 'os';
+import { join } from 'path';
+
+// ── Singleton lock — hard exit if another instance is alive ──────────────────
+const LOCK_FILE = '/tmp/opus-backlog.lock';
+function acquireLock() {
+  if (existsSync(LOCK_FILE)) {
+    try {
+      const pid = parseInt(readFileSync(LOCK_FILE, 'utf8').trim());
+      process.kill(pid, 0); // throws if process dead
+      console.error(`[LOCK] Another instance (PID ${pid}) is alive — exiting.`);
+      process.exit(1);
+    } catch { /* stale lock — continue */ }
+  }
+  writeFileSync(LOCK_FILE, String(process.pid));
+}
+function releaseLock() {
+  try {
+    if (readFileSync(LOCK_FILE, 'utf8').trim() === String(process.pid)) unlinkSync(LOCK_FILE);
+  } catch {}
+}
+process.on('exit', releaseLock);
+process.on('SIGTERM', () => { releaseLock(); process.exit(0); });
+process.on('SIGINT',  () => { releaseLock(); process.exit(0); });
+
+const SA_KEY = JSON.parse(readFileSync(process.env.GOOGLE_SA_KEY_PATH || './secrets/google-sa-key.json', 'utf8'));
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+const ALEX_EMAIL = 'alex@massivlust.no';
+const MODEL = 'claude-opus-4-7';
+const MODEL_FALLBACK = 'claude-sonnet-4-6';
+const BATCH_SIZE = 10;
+const MIN_CONFIDENCE = 0.92;
+const STATUS_PING_EVERY = 1000;
+const LOG_FILE = './secrets/opus-backlog-jun15.log';
+const GPS_RADIUS_M = 500; // meters — within 500m of project address = project photo
+const DRIVE_TIMEOUT_MS = 25000;
+
+const delay = (ms) => new Promise(r => setTimeout(r, ms));
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms)),
+  ]);
+}
+
+function pastDeadline() {
+  const now = new Date();
+  const oslo = new Date(now.toLocaleString('en-US', { timeZone: 'Europe/Oslo' }));
+  // Stop at 06:00 Oslo on June 16
+  return oslo.getDate() === 16 && oslo.getHours() >= 6;
+}
+
+function log(msg) {
+  const line = `[${new Date().toISOString().slice(11,19)}] ${msg}`;
+  console.log(line);
+  try { appendFileSync(LOG_FILE, line + '\n'); } catch {}
+}
+
+function makeDrive() {
+  const auth = new google.auth.JWT(SA_KEY.client_email, null, SA_KEY.private_key,
+    ['https://www.googleapis.com/auth/drive'], ALEX_EMAIL);
+  return google.drive({ version: 'v3', auth });
+}
+
+// Haversine distance in meters
+function haversineM(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLng/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// Nominatim geocode — rate limited to 1 req/sec per OSM policy
+async function geocodeAddress(address) {
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address + ', Norway')}&format=json&limit=1`;
+    const res = execSync(`curl -s -A "massivlust-file-classifier/1.0" "${url}"`,
+      { timeout: 10000, encoding: 'utf-8' });
+    const data = JSON.parse(res);
+    if (data?.[0]?.lat) return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+    return null;
+  } catch { return null; }
+}
+
+async function buildProjectGpsMap(projects) {
+  const gpsMap = new Map(); // project_id → { lat, lng, name }
+  log(`Geocoding ${projects.length} project addresses via Nominatim...`);
+  let geocoded = 0;
+  for (const p of projects) {
+    if (!p.address) continue;
+    const coords = await geocodeAddress(p.address);
+    if (coords) {
+      gpsMap.set(p.id, { ...coords, name: p.name });
+      geocoded++;
+    }
+    await delay(1100); // OSM rate limit: max 1 req/sec
+  }
+  log(`Geocoded ${geocoded}/${projects.length} projects`);
+  return gpsMap;
+}
+
+function normalise(s) {
+  return (s || '').toLowerCase().replace(/[^a-zæøå0-9]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function matchProjectByFolder(folderPath, projects) {
+  if (!folderPath) return null;
+  const normPath = normalise(folderPath);
+  let best = null;
+  for (const p of projects) {
+    const normName = normalise(p.name);
+    if (normName.length > 3 && normPath.includes(normName)) {
+      if (!best || normName.length > normalise(best.name).length) best = p;
+    }
+  }
+  return best;
+}
+
+async function getImageExifGps(drive, fileId) {
+  try {
+    const res = await withTimeout(
+      drive.files.get({ fileId, supportsAllDrives: true, fields: 'imageMediaMetadata' }),
+      DRIVE_TIMEOUT_MS, 'getExifGps'
+    );
+    const loc = res.data.imageMediaMetadata?.location;
+    if (loc?.latitude !== undefined) return { lat: loc.latitude, lng: loc.longitude };
+    return null;
+  } catch { return null; }
+}
+
+async function getPdfText(drive, fileId, mimeType) {
+  try {
+    if (mimeType === 'application/vnd.google-apps.document') {
+      const res = await withTimeout(
+        drive.files.export({ fileId, mimeType: 'text/plain' }, { responseType: 'arraybuffer' }),
+        DRIVE_TIMEOUT_MS, 'exportDoc'
+      );
+      return Buffer.from(res.data).toString('utf8', 0, 8000);
+    }
+    const res = await withTimeout(
+      drive.files.get({ fileId, supportsAllDrives: true, alt: 'media' }, { responseType: 'arraybuffer' }),
+      DRIVE_TIMEOUT_MS, 'getPdfMedia'
+    );
+    return Buffer.from(res.data).toString('utf8', 0, 8000).replace(/[^\x20-\x7E\xA0-\xFF\n\r]/g, ' ');
+  } catch { return null; }
+}
+
+function callClaude(prompt, model) {
+  const tmp = join(tmpdir(), `opus-backlog-${Date.now()}.txt`);
+  writeFileSync(tmp, prompt);
+  try {
+    const raw = execSync(`cat "${tmp}" | claude --print --model ${model} --output-format json --dangerously-skip-permissions`,
+      { timeout: 90000, maxBuffer: 2 * 1024 * 1024, encoding: 'utf-8' }).trim();
+    let text = raw;
+    try {
+      const env = JSON.parse(raw);
+      if (env.is_error) throw new Error(env.result || 'model error');
+      if (env.result) text = env.result;
+    } catch (e) { if (e.message !== 'model error') text = raw; else throw e; }
+    text = text.replace(/```json\s*/gi, '').replace(/```/g, '').trim();
+    const i = text.indexOf('{');
+    if (i < 0) return null;
+    return JSON.parse(text.slice(i, text.lastIndexOf('}') + 1));
+  } catch (err) {
+    log(`Claude error (${model}): ${err.message?.slice(0, 80)}`);
+    return null;
+  } finally {
+    try { unlinkSync(tmp); } catch {}
+  }
+}
+
+function buildTextPrompt(file, topProjects, allProjectNames, textContent) {
+  return `Du er klassifiseringsagent for Massivlust AS (norsk massivtre/CLT-byggefirma).
+
+Fil: ${file.file_name}
+Type: ${file.mime_type}
+Mappe: ${file.current_drive_folder_path || file.current_drive_folder_name || 'ukjent'}
+${file.gmail_subject ? `E-post emne: "${file.gmail_subject}"` : ''}
+${file.gmail_from ? `Fra: ${file.gmail_from}` : ''}
+
+Topp prosjekt-kandidater (embeddings):
+${topProjects}
+
+PROSJEKTER: ${allProjectNames.slice(0, 15).join(', ')}...
+
+${textContent ? `INNHOLD (side 1-2):\n${textContent.slice(0, 4000)}` : '[Ingen tekst tilgjengelig — bruk filnavn og kontekst]'}
+
+OPPGAVE: Klassifiser for Massivlust AS.
+- Prosjektdokument (kontrakt, KS, avvik, tegning, tilbud, faktura mot Massivlust, HMS) → is_personal=false, project_id fra kandidater
+- Bransjerelatert uten prosjekt → is_personal=false, project_id=null
+- Privat (bank, NAV, helse, forsikring, kvittering privat, personlig) → is_personal=true, project_id=null
+
+Returner KUN JSON:
+{"is_personal": true/false, "project_id": "<uuid eller null>", "confidence": 0.0-1.0, "reason": "<15-25 ord>"}`;
+}
+
+async function classifyWithOpus(file, projects) {
+  const topProjects = [];
+  try {
+    const sug = typeof file.v2_suggestions === 'string' ? JSON.parse(file.v2_suggestions) : file.v2_suggestions;
+    if (Array.isArray(sug)) {
+      for (const s of sug.slice(0, 3)) {
+        const proj = projects.find(p => p.id === s.project_id || p.name === s.project_name);
+        if (proj) topProjects.push(`  • ${proj.name} (${proj.id})`);
+      }
+    }
+  } catch {}
+
+  const topProjectsStr = topProjects.join('\n') || '  (ingen)';
+  const allNames = projects.map(p => p.name);
+
+  const prompt = buildTextPrompt(file, topProjectsStr, allNames, file._textContent);
+  let result = callClaude(prompt, MODEL);
+  if (!result) {
+    await delay(3000);
+    result = callClaude(prompt, MODEL_FALLBACK);
+  }
+  return result;
+}
+
+async function classifyImageDeterministic(file, projects, projectGpsMap, drive) {
+  const folderPath = file.current_drive_folder_path || file.current_drive_folder_name || '';
+
+  // 1. Google Foto / Chrome OS backup paths = personal
+  if (/Google Foto|Skybaserte sikkerhetskopier|Google Photos/i.test(folderPath)) {
+    return { is_personal: true, project_id: null, confidence: 0.97, reason: 'Google Foto/backup-mappe — personlig bildearkiv', method: 'folder-personal' };
+  }
+
+  // 2. Folder path matches a project name
+  const folderMatch = matchProjectByFolder(folderPath, projects);
+  if (folderMatch) {
+    return { is_personal: false, project_id: folderMatch.id, confidence: 0.94, reason: `Mappesti inneholder prosjektnavn: ${folderMatch.name}`, method: 'folder-project' };
+  }
+
+  // 3. GPS proximity against geocoded project addresses
+  if (file.drive_file_id && projectGpsMap.size > 0) {
+    const gps = await getImageExifGps(drive, file.drive_file_id);
+    if (gps) {
+      let closest = null;
+      let closestDist = Infinity;
+      for (const [projId, projCoords] of projectGpsMap) {
+        const dist = haversineM(gps.lat, gps.lng, projCoords.lat, projCoords.lng);
+        if (dist < closestDist) { closestDist = dist; closest = { id: projId, ...projCoords }; }
+      }
+      if (closest && closestDist <= GPS_RADIUS_M) {
+        return {
+          is_personal: false, project_id: closest.id, confidence: 0.95,
+          reason: `GPS ${gps.lat.toFixed(4)},${gps.lng.toFixed(4)} er ${Math.round(closestDist)}m fra ${closest.name}`,
+          method: 'gps-proximity',
+        };
+      }
+      // Has GPS but not near any project — likely personal outdoor photo
+      if (gps.lat >= 55 && gps.lat <= 72) { // Norway bounds
+        return { is_personal: true, project_id: null, confidence: 0.82, reason: 'GPS i Norge men ikke nær noen prosjektadresse', method: 'gps-personal' };
+      }
+    }
+  }
+
+  return null; // No signal — stay needs_review
+}
+
+async function saveResult(fileId, result, model) {
+  if (!result) return 'unsure';
+
+  const update = {
+    v2_model: model,
+    v2_confidence: result.confidence,
+    v2_is_personal: result.is_personal,
+    v2_project_id: result.project_id || null,
+    v2_processed_at: new Date().toISOString(),
+  };
+
+  if (result.confidence >= MIN_CONFIDENCE) {
+    update.status = result.is_personal ? 'personal' : 'classified';
+  }
+  // else: keep needs_review but update model metadata
+
+  await supabase.from('massivlust_unclassified_files').update(update).eq('id', fileId);
+  return update.status || 'needs_review';
+}
+
+// Supabase query with 30s AbortController timeout — prevents silent hangs
+async function fetchWithTimeout(queryBuilder) {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 30000);
+  try {
+    const res = await queryBuilder.abortSignal(ac.signal);
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function runPhase(label, mimeFilter, processor, stats) {
+  log(`\n--- Phase: ${label} ---`);
+  let offset = 0;
+
+  while (true) {
+    if (pastDeadline()) { log(`06:00 DEADLINE — stopping ${label}`); break; }
+
+    // Use incrementing offset — each file processed at most once, no re-fetch of low-conf files
+    let query = supabase
+      .from('massivlust_unclassified_files')
+      .select(`id, file_name, drive_file_id, source_type, mime_type,
+        current_drive_folder_name, current_drive_folder_path,
+        gmail_subject, gmail_from, v2_suggestions`)
+      .eq('status', 'needs_review')
+      .order('id', { ascending: true })
+      .range(offset, offset + BATCH_SIZE - 1);
+
+    if (mimeFilter === 'image') query = query.like('mime_type', 'image/%');
+    else if (mimeFilter === 'pdf') query = query.or('mime_type.eq.application/pdf,mime_type.like.text/%,mime_type.eq.application/vnd.google-apps.document');
+    else if (mimeFilter === 'other') query = query.not('mime_type', 'like', 'image/%').not('mime_type', 'like', 'text/%').neq('mime_type', 'application/pdf').neq('mime_type', 'application/vnd.google-apps.document');
+
+    const { data: files, error } = await fetchWithTimeout(query);
+    if (error) { log(`DB error: ${error.message}`); break; }
+    if (!files?.length) { log(`${label}: done`); break; }
+
+    for (const file of files) {
+      if (pastDeadline()) { log('06:00 DEADLINE mid-file'); break; }
+
+      try {
+        const result = await processor(file);
+        // Always update v2_processed_at so file won't be re-fetched in a future run starting from same offset
+        const finalStatus = await saveResult(file.id, result, result?._model || MODEL);
+
+        stats.processed++;
+        if (finalStatus === 'classified') stats.classified++;
+        else if (finalStatus === 'personal') stats.personal++;
+        else if (result) stats.lowConf++;
+        else stats.unsure++;
+
+        if (stats.processed % 100 === 0) {
+          log(`  [${label}] ${stats.processed} total: classified=${stats.classified} personal=${stats.personal} unsure=${stats.unsure} lowconf=${stats.lowConf} err=${stats.errors}`);
+        }
+
+        if (stats.processed % STATUS_PING_EVERY === 0) {
+          const msg = `OPUS BACKLOG STATUS — ${stats.processed} behandlet\nKlassifisert: ${stats.classified} | Personlig: ${stats.personal} | Lav-konf: ${stats.lowConf} | Usikker: ${stats.unsure} | Feil: ${stats.errors}`;
+          try { execSync(`cortextos bus send-message bridge normal ${JSON.stringify(msg)} 1781559112722-bridge-mke8o`, { encoding: 'utf-8' }); } catch {}
+        }
+
+        await delay(result?._model ? 300 : 50); // slower for Opus calls
+      } catch (err) {
+        log(`  [ERR] ${file.file_name}: ${err.message?.slice(0, 80)}`);
+        stats.errors++;
+        // mark needs_review with error flag so it drops from result-less loops
+        await supabase.from('massivlust_unclassified_files')
+          .update({ v2_model: MODEL, v2_processed_at: new Date().toISOString() })
+          .eq('id', file.id);
+        await delay(500);
+      }
+    }
+
+    offset += BATCH_SIZE;
+    if (pastDeadline()) break;
+    await delay(200);
+  }
+}
+
+async function main() {
+  acquireLock(); // exits if another instance is alive
+  log('=== OPUS BACKLOG CLASSIFY — pipeline_opus_backlog_jun15 ===');
+  log(`Model: ${MODEL} (fallback: ${MODEL_FALLBACK}) | GPS radius: ${GPS_RADIUS_M}m | Hard stop: 06:00 Oslo | PID: ${process.pid}`);
+
+  const drive = makeDrive();
+
+  const { data: projectRows } = await supabase.from('massivlust_projects').select('id, name, address');
+  const projects = projectRows || [];
+  log(`Loaded ${projects.length} projects`);
+
+  const { count: totalNeedsReview } = await supabase
+    .from('massivlust_unclassified_files')
+    .select('id', { count: 'exact', head: true })
+    .eq('status', 'needs_review');
+  log(`Total needs_review: ${totalNeedsReview}`);
+
+  const startTime = Date.now();
+
+  const stats = { processed: 0, classified: 0, personal: 0, lowConf: 0, unsure: 0, errors: 0 };
+
+  // PHASE 1: PDFs + text — Opus reads actual content (starts immediately, no geocoding delay)
+  if (!pastDeadline()) {
+    await runPhase('PDF/text', 'pdf', async (file) => {
+      let textContent = null;
+      if (file.drive_file_id) textContent = await getPdfText(drive, file.drive_file_id, file.mime_type);
+      file._textContent = textContent;
+      const r = await classifyWithOpus(file, projects);
+      if (r) r._model = MODEL;
+      return r;
+    }, stats);
+  }
+
+  // PHASE 2: Other files — filename + context via Opus
+  if (!pastDeadline()) {
+    await runPhase('other', 'other', async (file) => {
+      const r = await classifyWithOpus(file, projects);
+      if (r) r._model = MODEL;
+      return r;
+    }, stats);
+  }
+
+  // PHASE 3: Images — deterministic GPS + folder heuristics, NO Opus tokens
+  // Geocode project addresses now (only ~73s for 66 projects via Nominatim)
+  let projectGpsMap = new Map();
+  if (!pastDeadline()) {
+    projectGpsMap = await buildProjectGpsMap(projects);
+  }
+  if (!pastDeadline()) {
+    await runPhase('images (deterministic)', 'image', async (file) => {
+      const r = await classifyImageDeterministic(file, projects, projectGpsMap, drive);
+      if (r) r._model = 'deterministic-gps';
+      return r;
+    }, stats);
+  }
+
+  log('\n=== OPUS BACKLOG FERDIG ===');
+  log(`Total behandlet:      ${stats.processed}`);
+  log(`Klassifisert (≥0.92): ${stats.classified}`);
+  log(`Personlig (≥0.92):    ${stats.personal}`);
+  log(`Lav konfidens:        ${stats.lowConf}`);
+  log(`Ingen signal:         ${stats.unsure}`);
+  log(`Feil:                 ${stats.errors}`);
+  log(`Kjøretid:             ${Math.round((Date.now()-startTime)/60000)} min`);
+
+  await supabase.from('massivlust_sync_runs').insert({
+    source: 'pipeline_opus_backlog_jun15',
+    status: 'success',
+    started_at: new Date(startTime).toISOString(),
+    ended_at: new Date().toISOString(),
+    rows_in: totalNeedsReview || 0,
+    rows_upserted: stats.classified + stats.personal,
+    rows_failed: stats.errors,
+    org_id: 'massivlust',
+  });
+
+  const finalMsg = `OPUS BACKLOG FERDIG (pipeline_opus_backlog_jun15)
+
+Behandlet: ${stats.processed}/${totalNeedsReview}
+Klassifisert til prosjekt (≥0.92): ${stats.classified}
+Klassifisert som personlig (≥0.92): ${stats.personal}
+Lav konfidens (<0.92, v2_model oppdatert): ${stats.lowConf}
+Ingen signal (stays needs_review): ${stats.unsure}
+Feil: ${stats.errors}
+Kjøretid: ${Math.round((Date.now()-startTime)/60000)} min
+
+Rekkefølge: PDF+tekst (Opus leser innhold) → andre (Opus filnavn+kontekst) → bilder (deterministisk: Google Foto-mappe→personal, mappesti-match→project, GPS-Haversine ${GPS_RADIUS_M}m mot Nominatim-geocodede adresser→project/personal)
+
+Prosjekter geocodet: ${projectGpsMap.size}/${projects.length}`;
+
+  try {
+    execSync(`cortextos bus send-message bridge normal ${JSON.stringify(finalMsg)} 1781559112722-bridge-mke8o`, { encoding: 'utf-8' });
+    log('Final rapport sendt.');
+  } catch (e) {
+    log(`Bridge send feilet: ${e.message?.slice(0, 80)}`);
+  }
+}
+
+main().catch(err => {
+  console.error(`Fatal: ${err.message}`);
+  process.exit(1);
+});

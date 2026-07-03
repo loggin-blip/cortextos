@@ -1,9 +1,10 @@
 {
   "agent_name": "{{agent_name}}",
+  "model": "claude-sonnet-4-6",
   "enabled": true,
   "runtime": "claude-code",
   "startup_delay": 0,
-  "max_session_seconds": 255600,
+  "max_session_seconds": 86400,
   "max_crashes_per_day": 10,
   "working_directory": "",
   "timezone": "",

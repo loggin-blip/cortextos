@@ -8,6 +8,7 @@ import {
   recordInboundTelegram,
   cacheLastSent,
   readLastSent,
+  buildRecentHistory,
 } from '../../../src/telegram/logging';
 import { TelegramAPI } from '../../../src/telegram/api';
 import type { BusPaths, TelegramMessage } from '../../../src/types';
@@ -277,5 +278,55 @@ describe('TelegramAPI.sendPhoto', () => {
     expect(body.get('photo')).toBeInstanceOf(Blob);
     expect(body.get('caption')).toBeNull();
     expect(body.get('reply_markup')).toBeNull();
+  });
+
+  describe('buildRecentHistory', () => {
+    const chatId = 99;
+
+    const writeInbound = (entries: Array<{ text: string; ts: string }>) => {
+      const logs = join(testDir, 'logs', 'agent1');
+      mkdirSync(logs, { recursive: true });
+      const lines = entries
+        .map((e) => JSON.stringify({ chat_id: chatId, text: e.text, timestamp: e.ts }))
+        .join('\n');
+      writeFileSync(join(logs, 'inbound-messages.jsonl'), lines + '\n');
+    };
+
+    it('excludes the trailing inbound entry that matches excludeInboundText', () => {
+      writeInbound([
+        { text: 'first', ts: '2026-06-23T22:00:00Z' },
+        { text: 'second', ts: '2026-06-23T22:01:00Z' },
+        { text: 'current', ts: '2026-06-23T22:02:00Z' },
+      ]);
+
+      const result = buildRecentHistory(testDir, 'agent1', chatId, 6, 'current');
+      expect(result).not.toContain('current');
+      expect(result).toContain('first');
+      expect(result).toContain('second');
+    });
+
+    it('returns full history when no excludeInboundText is given', () => {
+      writeInbound([
+        { text: 'first', ts: '2026-06-23T22:00:00Z' },
+        { text: 'current', ts: '2026-06-23T22:02:00Z' },
+      ]);
+
+      const result = buildRecentHistory(testDir, 'agent1', chatId, 6);
+      expect(result).toContain('first');
+      expect(result).toContain('current');
+    });
+
+    it('only strips the trailing match, not earlier duplicates', () => {
+      writeInbound([
+        { text: 'echo', ts: '2026-06-23T22:00:00Z' },
+        { text: 'middle', ts: '2026-06-23T22:01:00Z' },
+        { text: 'echo', ts: '2026-06-23T22:02:00Z' },
+      ]);
+
+      const result = buildRecentHistory(testDir, 'agent1', chatId, 6, 'echo');
+      const occurrences = (result?.match(/echo/g) ?? []).length;
+      expect(occurrences).toBe(1);
+      expect(result).toContain('middle');
+    });
   });
 });

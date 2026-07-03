@@ -4,42 +4,85 @@ import { supabase } from '../supabase.js';
 import * as syncRuns from '../sync-runs.js';
 import { logger } from '../logger.js';
 
-export async function run({ mode = 'incremental', dryRun = false } = {}) {
-  const runId = await syncRuns.start({ source: 'gmail_korrespondanse' });
+const MAILBOXES = (process.env.GMAIL_MAILBOXES || 'alex@massivlust.no,eivind@massivlust.no,vegard@massivlust.no,martin@massivlust.no,mathias@massivlust.no')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+export async function run({ mode = 'incremental', dryRun = false, mailbox = null, backfillMonths = 6 } = {}) {
+  if (mailbox) return runForMailbox(mailbox, { mode, dryRun, backfillMonths });
+
+  const totals = { upserted: 0, skipped: 0, failed: 0, total: 0 };
+  for (const mb of MAILBOXES) {
+    try {
+      const r = await runForMailbox(mb, { mode, dryRun, backfillMonths });
+      totals.upserted += r.upserted;
+      totals.skipped += r.skipped;
+      totals.failed += r.failed;
+      totals.total += r.total;
+    } catch (err) {
+      logger.error({ mailbox: mb, err: err.message }, 'Mailbox sync failed');
+    }
+  }
+  return totals;
+}
+
+async function runForMailbox(mailbox, { mode, dryRun, backfillMonths = 6 }) {
+  const source = `gmail_korrespondanse:${mailbox}`;
+  const runId = await syncRuns.start({ source });
 
   try {
     let messages;
     let newHistoryId;
 
     if (mode === 'backfill') {
-      const twoYearsAgo = new Date();
-      twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
-      const after = Math.floor(twoYearsAgo.getTime() / 1000);
-      const refs = await gmail.searchMessages(`after:${after}`, 10000);
+      const cutoff = new Date();
+      cutoff.setMonth(cutoff.getMonth() - backfillMonths);
+      const after = Math.floor(cutoff.getTime() / 1000);
+      const refs = await gmail.searchMessages(`after:${after}`, 10000, mailbox);
       messages = refs;
     } else {
-      const cursor = await syncRuns.getLastCursor('gmail_korrespondanse');
+      const cursor = await syncRuns.getLastCursor(source);
+      let usedHistory = false;
       if (cursor?.historyId) {
-        const result = await gmail.listHistory(cursor.historyId);
-        messages = result.messages;
-      } else {
-        const profile = await gmail.getProfile();
+        try {
+          const result = await gmail.listHistory(cursor.historyId, mailbox);
+          messages = result.messages;
+          usedHistory = true;
+        } catch (err) {
+          if (err.status === 404 || err.code === 404) {
+            logger.warn({ mailbox, staleHistoryId: cursor.historyId }, 'Gmail historyId stale — falling back to 1d search');
+          } else {
+            throw err;
+          }
+        }
+      }
+      if (!usedHistory) {
+        const profile = await gmail.getProfile(mailbox);
         newHistoryId = profile.historyId;
-        const refs = await gmail.searchMessages('newer_than:7d', 200);
+        const refs = await gmail.searchMessages('newer_than:1d', 200, mailbox);
         messages = refs;
       }
     }
 
-    logger.info({ count: messages.length, mode }, 'Gmail messages to process');
+    logger.info({ mailbox, count: messages.length, mode }, 'Gmail messages to process');
 
     let upserted = 0, skipped = 0, failed = 0;
-
     const delay = (ms) => new Promise(r => setTimeout(r, ms));
     let processed = 0;
 
     for (const msg of messages) {
       try {
-        const full = await gmail.getMessage(msg.id);
+        const full = await gmail.getMessage(msg.id, mailbox);
+
+        // Hopp over Gmail-kategorisert nyhetsbrev/reklame/sosialt/varsler — ikke ekte kunde-
+        // dialog. Gjaldt ~93% av «ubesvart» i CRM-et (Dalux, Empty legs, solcellelamper,
+        // estatenyheter osv.). Post-fetch på labelIds → virker for både history- og search-stien.
+        const _cats = full.labelIds || [];
+        if (_cats.includes('CATEGORY_PROMOTIONS') || _cats.includes('CATEGORY_SOCIAL') || _cats.includes('CATEGORY_FORUMS') || _cats.includes('SPAM')) {
+          skipped++;
+          processed++;
+          continue;
+        }
+
         const headers = gmail.parseHeaders(full.payload?.headers || []);
         const body = gmail.extractBody(full.payload || {});
 
@@ -54,7 +97,7 @@ export async function run({ mode = 'incremental', dryRun = false } = {}) {
           skipped++;
           processed++;
           if (processed % 100 === 0) {
-            logger.info({ processed, total: messages.length, upserted, skipped, failed }, 'Gmail backfill progress');
+            logger.info({ mailbox, processed, total: messages.length, upserted, skipped, failed }, 'Gmail backfill progress');
           }
           continue;
         }
@@ -76,10 +119,11 @@ export async function run({ mode = 'incremental', dryRun = false } = {}) {
           gmail_synced_at: new Date().toISOString(),
           raw_payload: full,
           org_id: 'massivlust',
+          source_mailbox: mailbox,
         };
 
         if (dryRun) {
-          logger.info({ msgId: full.id, subject: headers.subject, projectId: row.project_id }, 'DRY-RUN would upsert');
+          logger.info({ mailbox, msgId: full.id, subject: headers.subject, projectId: row.project_id }, 'DRY-RUN would upsert');
           upserted++;
           continue;
         }
@@ -93,20 +137,25 @@ export async function run({ mode = 'incremental', dryRun = false } = {}) {
 
         processed++;
         if (processed % 100 === 0) {
-          logger.info({ processed, total: messages.length, upserted, skipped, failed }, 'Gmail backfill progress');
+          logger.info({ mailbox, processed, total: messages.length, upserted, skipped, failed }, 'Gmail backfill progress');
         }
         if (processed % 50 === 0) await delay(1000);
       } catch (err) {
+        if (err.code === 404 || err.status === 404) {
+          skipped++;
+          processed++;
+          continue;
+        }
         failed++;
         if (err.code === 429 || err.status === 429) {
-          logger.warn({ processed }, 'Rate limited — pausing 30s');
+          logger.warn({ mailbox, processed }, 'Rate limited — pausing 30s');
           await delay(30000);
         }
-        logger.error({ err, msgId: msg.id }, 'Gmail upsert failed');
+        logger.error({ mailbox, msgId: msg.id, status: err.status, message: err.message }, 'Gmail upsert failed');
       }
     }
 
-    const profile = await gmail.getProfile();
+    const profile = await gmail.getProfile(mailbox);
     const cursor = { historyId: newHistoryId || profile.historyId };
 
     await syncRuns.complete(runId, {

@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+Local text extraction + bge-m3 (Ollama) embedding for PDFs.
+Replaces Gemini embedding — free, local, same 1024-dim as massivlust-images.
+- Text extracted with PyMuPDF (free, local)
+- Embedded with bge-m3 via Ollama (http://localhost:11434) — free, 1024-dim
+- Scanned/image-only → prints "SKIP (needs-flash)", exits 0
+
+CONCURRENCY NOTE: ChromaDB (hnswlib/Rust) is NOT safe for concurrent multi-process writes.
+All ChromaDB access is serialised with an exclusive fcntl lock (chroma-write.lock).
+Ollama embedding calls happen BEFORE acquiring the lock — they are fully parallel.
+Output format (for pdf-ingest-leantag.mjs):
+    Added N chunk(s)
+    Cost: $X.XXXX
+"""
+import sys, json, hashlib, argparse, pathlib, datetime, time, fcntl, urllib.request
+
+CHUNK_SIZE     = 1500
+CHUNK_OVERLAP  = 200
+MIN_TEXT_LEN   = 100
+OLLAMA_URL     = 'http://localhost:11434/api/embed'
+EMBED_MODEL    = 'bge-m3'
+EMBED_DIMS     = 1024
+
+
+def file_id(path, chunk_idx):
+    return hashlib.md5(str(path).encode()).hexdigest()[:12] + f'_chunk{chunk_idx}'
+
+
+def chunk_text(text):
+    paras = [p.strip() for p in text.split('\n\n') if p.strip()]
+    if not paras:
+        return [text[:CHUNK_SIZE]] if text.strip() else []
+
+    chunks, current, current_len = [], [], 0
+    for para in paras:
+        add_len = len(para) + (2 if current else 0)
+        if current_len + add_len > CHUNK_SIZE and current:
+            chunk = '\n\n'.join(current)
+            chunks.append(chunk)
+            tail = chunk[-CHUNK_OVERLAP:].strip()
+            current = [tail] if tail else []
+            current_len = len(tail) if current else 0
+        current.append(para)
+        current_len += len(para) + (2 if len(current) > 1 else 0)
+    if current:
+        chunks.append('\n\n'.join(current))
+
+    final = []
+    for ch in chunks:
+        if len(ch) <= CHUNK_SIZE:
+            final.append(ch)
+        else:
+            for i in range(0, len(ch), CHUNK_SIZE - CHUNK_OVERLAP):
+                piece = ch[i:i + CHUNK_SIZE]
+                if piece.strip():
+                    final.append(piece)
+    return final if final else [text[:CHUNK_SIZE]]
+
+
+def extract_text(pdf_path):
+    import fitz  # PyMuPDF
+    doc = fitz.open(pdf_path)
+    pages = [page.get_text() for page in doc]
+    doc.close()
+    return '\n\n'.join(pages)
+
+
+def embed_bge(text, max_retries=3):
+    payload = json.dumps({'model': EMBED_MODEL, 'input': text[:8000]}).encode()
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(OLLAMA_URL, data=payload, headers={'content-type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return json.loads(r.read())['embeddings'][0]
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise RuntimeError(f'Ollama embed failed: {e}') from e
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('file_path')
+    parser.add_argument('--collection', default='massivlust-docs')
+    args = parser.parse_args()
+
+    file_path = pathlib.Path(args.file_path).resolve()
+    db_path   = str(pathlib.Path.home() / '.mmrag' / 'chromadb')
+    lock_path = str(pathlib.Path.home() / '.mmrag' / 'chroma-write.lock')
+    now       = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    # ── 1. Extract text locally (free, no locks needed) ──────────────────────
+    try:
+        raw_text = extract_text(str(file_path))
+    except Exception as e:
+        print(f'Error extracting text: {e}', file=sys.stderr)
+        sys.exit(1)
+
+    if len(raw_text.strip()) < MIN_TEXT_LEN:
+        print('SKIP (needs-flash)')
+        sys.exit(0)
+
+    chunks = chunk_text(raw_text)
+    if not chunks:
+        print('SKIP (needs-flash)')
+        sys.exit(0)
+
+    # ── 2. Embed all chunks with bge-m3/Ollama (free, local, parallel-safe) ──
+    doc_ids    = [file_id(str(file_path), i) for i in range(len(chunks))]
+    embeddings = []
+    metas      = []
+
+    for i, chunk in enumerate(chunks):
+        try:
+            emb = embed_bge(chunk)
+        except Exception as e:
+            print(f'Embed error chunk {i}: {e}', file=sys.stderr)
+            sys.exit(1)
+        embeddings.append(emb)
+        metas.append({
+            'source':       str(file_path),
+            'type':         'pdf',
+            'chunk_index':  i,
+            'total_chunks': len(chunks),
+            'filename':     file_path.name,
+            'file_ext':     file_path.suffix,
+            'ingested_at':  now,
+        })
+
+    # ── 3. Write to ChromaDB under exclusive lock (ONE writer at a time) ─────
+    import chromadb
+    added = 0
+
+    with open(lock_path, 'a') as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            chroma = chromadb.PersistentClient(path=db_path)
+            col    = chroma.get_or_create_collection(args.collection)
+            existing = set(col.get(ids=doc_ids)['ids'])
+            to_add_idx = [i for i, d in enumerate(doc_ids) if d not in existing]
+            if to_add_idx:
+                col.add(
+                    ids        = [doc_ids[i]    for i in to_add_idx],
+                    embeddings = [embeddings[i] for i in to_add_idx],
+                    documents  = [chunks[i]     for i in to_add_idx],
+                    metadatas  = [metas[i]      for i in to_add_idx],
+                )
+                added = len(to_add_idx)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+    print(f'Added {added} chunk(s)')
+    print(f'Cost: $0.0000')
+
+
+if __name__ == '__main__':
+    main()
