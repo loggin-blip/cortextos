@@ -3,9 +3,12 @@ import * as drive from '../lib/google-drive.js';
 import { supabase } from '../supabase.js';
 import * as syncRuns from '../sync-runs.js';
 import { logger } from '../logger.js';
+import { config } from '../config.js';
 
 const BATCH_LIMIT = Number(process.env.VEDLEGG_BATCH_LIMIT) || 20;
 const MAX_SIZE_BYTES = Number(process.env.VEDLEGG_MAX_SIZE_BYTES) || 25 * 1024 * 1024;
+// Mailboxes the SA has delegation rights for; others fall back to the default impersonateEmail
+const DELEGATED_MAILBOXES = new Set(['alex@massivlust.no','martin@massivlust.no','eivind@massivlust.no','vegard@massivlust.no']);
 
 export async function run({ mode = 'incremental', dryRun = false } = {}) {
   const source = 'mail_vedlegg';
@@ -60,12 +63,13 @@ export async function run({ mode = 'incremental', dryRun = false } = {}) {
 
           const buffer = await gmail.getAttachment(row.gmail_message_id, att.attachmentId, row.source_mailbox);
           const safeName = buildFilename(row.dato, row.gmail_message_id, att.filename);
+          const uploadAs = DELEGATED_MAILBOXES.has(row.source_mailbox) ? row.source_mailbox : config.google.impersonateEmail;
           const uploadedFile = await drive.uploadFile({
             folderId: folder.drive_folder_id,
             name: safeName,
             mimeType: att.mimeType,
             buffer,
-            impersonateEmail: row.source_mailbox,
+            impersonateEmail: uploadAs,
           });
 
           const { error: insErr } = await supabase.from('massivlust_dokumenter').insert({

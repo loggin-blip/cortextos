@@ -36,6 +36,19 @@ PERSONAL_RX = re.compile(
 )
 
 
+def _clean_meta(m: dict) -> dict:
+    """ChromaDB only accepts str/int/float/bool — strip None and coerce the rest."""
+    out = {}
+    for k, v in m.items():
+        if v is None:
+            out[k] = ""
+        elif isinstance(v, (str, int, float, bool)):
+            out[k] = v
+        else:
+            out[k] = str(v)
+    return out
+
+
 def supa(method, path, body=None, query=None):
     url = f"{SUPA_URL}/rest/v1/{path}"
     if query:
@@ -206,7 +219,7 @@ def process_mails(limit):
             col.delete(where={"filename": base})
         except Exception:
             pass
-        col.add(ids=ids, documents=docs, metadatas=metas, embeddings=embs)
+        col.add(ids=ids, documents=docs, metadatas=[_clean_meta(m) for m in metas], embeddings=embs)
 
         mark_indexed("massivlust_korrespondanse", "gmail_message_id", mid, scope)
         n_idx += 1
@@ -355,7 +368,7 @@ def process_attachments(limit):
             col.delete(where={"filename": base})
         except Exception:
             pass
-        col.add(ids=ids, documents=docs, metadatas=metas, embeddings=embs)
+        col.add(ids=ids, documents=docs, metadatas=[_clean_meta(m) for m in metas], embeddings=embs)
 
         mark_indexed("massivlust_dokumenter", "id", doc_id)
         n_idx += 1
