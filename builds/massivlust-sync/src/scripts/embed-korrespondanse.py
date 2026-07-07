@@ -152,6 +152,7 @@ def process_mails(limit):
             "select=gmail_message_id,project_id,dato,source_mailbox,emne,fra_navn,fra_epost,til_navn,innhold,raw_payload"
             "&kb_indexed_at=is.null"
             "&project_id=not.is.null"
+            "&gmail_message_id=not.is.null"
             f"&order=dato.desc&limit={limit}"
         ),
     )

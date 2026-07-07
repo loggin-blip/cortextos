@@ -64,7 +64,7 @@ export async function run({ mode = 'incremental', dryRun = false } = {}) {
             .from('massivlust_sync_runs')
             .select('payload')
             .eq('source', 'drive_ifc')
-            .eq('status', 'success')
+            .in('status', ['success', 'partial'])
             .order('ended_at', { ascending: false })
             .limit(1)
             .single();
@@ -92,28 +92,77 @@ export async function run({ mode = 'incremental', dryRun = false } = {}) {
             continue;
           }
 
-          for (const el of result.elementer) {
-            const { error } = await supabase
-              .from('massivlust_prosjekt_elementer')
-              .upsert({
+          // Fetch existing element_kodes for this project to avoid overwriting status/montert_at
+          const { data: existingRows, error: fetchErr } = await supabase
+            .from('massivlust_prosjekt_elementer')
+            .select('element_kode')
+            .eq('project_id', projectId)
+            .eq('org_id', 'massivlust');
+
+          if (fetchErr) {
+            failed++;
+            logger.error({ fetchErr, projectId }, 'Failed to fetch existing elements');
+          } else {
+            const existingKodes = new Set((existingRows || []).map(r => r.element_kode));
+            const newEls = result.elementer.filter(el => !existingKodes.has(el.element_kode));
+            const existingEls = result.elementer.filter(el => existingKodes.has(el.element_kode));
+
+            // Batch INSERT new elements with status: 'planlagt'
+            const chunkSize = 500;
+            for (let i = 0; i < newEls.length; i += chunkSize) {
+              const chunk = newEls.slice(i, i + chunkSize).map(el => ({
                 project_id: el.project_id,
                 element_kode: el.element_kode,
                 type: el.type,
-                status: el.status || 'planlagt',
+                status: 'planlagt',
                 vekt_kg: el.vekt_kg,
                 areal_m2: el.areal_m2,
                 leverandor: el.leverandor,
                 notes: el.notes,
                 org_id: 'massivlust',
                 updated_at: new Date().toISOString(),
-              }, { onConflict: 'project_id,element_kode' });
-
-            if (error) {
-              failed++;
-              logger.error({ error, el: el.element_kode }, 'Element upsert failed');
-            } else {
-              upserted++;
+              }));
+              const { error } = await supabase
+                .from('massivlust_prosjekt_elementer')
+                .insert(chunk);
+              if (error) {
+                failed += chunk.length;
+                logger.error({ error, count: chunk.length }, 'Element INSERT chunk failed');
+              } else {
+                upserted += chunk.length;
+              }
             }
+
+            // Batch UPDATE existing elements — only non-status fields
+            const updateConcurrency = 20;
+            for (let i = 0; i < existingEls.length; i += updateConcurrency) {
+              const batch = existingEls.slice(i, i + updateConcurrency);
+              const results = await Promise.all(batch.map(el =>
+                supabase
+                  .from('massivlust_prosjekt_elementer')
+                  .update({
+                    type: el.type,
+                    vekt_kg: el.vekt_kg,
+                    areal_m2: el.areal_m2,
+                    leverandor: el.leverandor,
+                    notes: el.notes,
+                    updated_at: new Date().toISOString(),
+                  })
+                  .eq('project_id', el.project_id)
+                  .eq('element_kode', el.element_kode)
+                  .eq('org_id', 'massivlust')
+              ));
+              for (const { error } of results) {
+                if (error) {
+                  failed++;
+                  logger.error({ error }, 'Element UPDATE failed');
+                } else {
+                  upserted++;
+                }
+              }
+            }
+
+            logger.info({ projectId, inserted: newEls.length, updated: existingEls.length }, 'Elements synced');
           }
         } finally {
           await rm(tmpDir, { recursive: true, force: true });
