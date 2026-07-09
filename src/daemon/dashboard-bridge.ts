@@ -105,7 +105,8 @@ export class DashboardBridge {
   }
 
   private async handleRow(row: DashboardMsgRow): Promise<void> {
-    const isDashboard = row.metadata && (row.metadata as { source?: unknown }).source === 'dashboard';
+    const src = row.metadata && (row.metadata as { source?: unknown }).source;
+    const isDashboard = typeof src === 'string' && src.startsWith('dashboard');
     if (!isDashboard) {
       // Ikke en dashboard-melding (kan være eldre Cortex-skrevet inbound uten processed=true).
       // Marker som processed så vi ikke retryer for evig.
