@@ -440,11 +440,17 @@ def sync_drive(dry_run, limit, log):
                 "web_view_link": f.get("webViewLink"),
                 "parent_folder_id": (f.get("parents") or [None])[0],
                 "chunk_count": len(chunks),
-                "org_id": ORG_ID,
                 "ingested_at": datetime.datetime.utcnow().isoformat() + "Z",
                 "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
             })
             log_info(log, f"drive: embedded {f['name']} ({len(chunks)} chunks) [{COLLECTION_S if sensitive else COLLECTION}]")
+            # Flush every 50 files so kb_sources counter increments visibly
+            if len(kb_source_rows) >= 50:
+                try:
+                    supa_upsert("massivlust_kb_sources", ["source_type", "drive_file_id"], kb_source_rows)
+                    kb_source_rows = []
+                except Exception as flush_err:
+                    log_info(log, f"drive: kb_sources flush error (will retry at end): {flush_err}")
 
         except Exception as e:
             log_info(log, f"drive: embed error {f['name']}: {e}")
