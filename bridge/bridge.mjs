@@ -175,20 +175,24 @@ async function catchUpScan() {
 catchUpScan()
 setInterval(catchUpScan, CATCHUP_SEC * 1000)
 
-// Scan inbox for any existing files (recovery on restart)
+// Scan inbox for any existing files. Runs on boot for recovery and periodically
+// as fallback — fs.watch on macOS (FSEvents) can silently stop firing after long
+// uptime or realtime-channel churn, so we always sweep at INBOX_SCAN_SEC cadence.
+const INBOX_SCAN_SEC = parseInt(process.env.INBOX_SCAN_INTERVAL_SEC || '30', 10)
 async function scanInbox() {
   try {
     const files = await fs.readdir(INBOX_DIR)
-    for (const f of files) {
-      if (f.endsWith('.json')) {
-        await handleIncomingFile(path.join(INBOX_DIR, f))
-      }
+    const jsonFiles = files.filter(f => f.endsWith('.json'))
+    if (jsonFiles.length) log('INFO', 'INBOX-SCAN:', jsonFiles.length, 'files')
+    for (const f of jsonFiles) {
+      await handleIncomingFile(path.join(INBOX_DIR, f))
     }
   } catch (e) {
     log('WARN', 'scanInbox', e.message)
   }
 }
 scanInbox()
+setInterval(scanInbox, INBOX_SCAN_SEC * 1000)
 
 // Watch inbox for new files
 const recentlyHandled = new Set()
