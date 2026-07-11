@@ -131,7 +131,17 @@ function bashLabel(d) {
   if (/heartbeat/.test(s) && /memory/.test(s)) return 'oppdaterte hukommelse og puls';
   if (/memory/.test(s)) return 'oppdaterte hukommelsen';
   if (/heartbeat/.test(s)) return 'oppdaterte pulsen';
-  if (/draft/.test(s)) return 'ordnet utkast';
+  if (/draft/.test(s)) {
+    if (/\b(check|poll|pending|get|fetch|list|read)\b/.test(s)) return 'sjekket utkast-køen';
+    if (/\b(create|insert|post|write|save|send)\b/.test(s)) return 'opprettet et utkast';
+    return 'sjekket utkast-køen';
+  }
+  if (/calendar/.test(s)) {
+    if (/\b(create|add|insert|schedule)\b/.test(s)) return 'la inn en kalenderhendelse';
+    return 'sjekket kalenderen';
+  }
+  if (/^ack\b/.test(s) || /\backn?owledge/.test(s)) return 'kvitterte en melding';
+  if (/\b(kurs|kompetanse)\b/.test(s)) return 'sjekket kompetansen';
   if (/\bt-?x\b/.test(s) || /tx status/.test(s)) return 'beregnet T-X-status';
   if (/task/.test(s) && /(create|start)/.test(s)) return 'opprettet en oppgave';
   return lowerFirst(d);
@@ -150,15 +160,29 @@ function gist(s) {
   return t.length > 56 ? t.slice(0, 56) + '…' : t;
 }
 
+// Redakter hemmeligheter før detalj/desc havner i logg — Supabase service_role,
+// publishable keys, bearer-tokens, Anthropic/OpenAI keys, Tripletex tokens.
+function redactSecrets(s) {
+  if (!s) return s;
+  return String(s)
+    .replace(/sb_secret_[A-Za-z0-9_-]+/g, 'sb_secret_***')
+    .replace(/sb_publishable_[A-Za-z0-9_-]+/g, 'sb_publishable_***')
+    .replace(/eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, 'jwt_***')
+    .replace(/sk-ant-[A-Za-z0-9_-]{20,}/g, 'sk-ant-***')
+    .replace(/sk-[A-Za-z0-9]{20,}/g, 'sk-***')
+    .replace(/Bearer\s+[A-Za-z0-9_.-]{20,}/gi, 'Bearer ***')
+    .replace(/(apikey|authorization|token|password|secret|key)["'\s:=]+[A-Za-z0-9_.-]{16,}/gi, '$1=***');
+}
+
 // Rå detalj til «klikk for mer» (full input — filsti / kommando / spørring).
 function detailOf(tool, input) {
   if (!input) return null;
-  if (input.command) return String(input.command).replace(/\s+/g, ' ').trim().slice(0, 300);
+  if (input.command) return redactSecrets(String(input.command).replace(/\s+/g, ' ').trim().slice(0, 300));
   if (input.file_path) return String(input.file_path);
-  if (input.query) return String(input.query).slice(0, 300);
+  if (input.query) return redactSecrets(String(input.query).slice(0, 300));
   if (input.pattern) return String(input.pattern);
-  if (input.url) return String(input.url);
-  if (input.description) return String(input.description);
+  if (input.url) return redactSecrets(String(input.url));
+  if (input.description) return redactSecrets(String(input.description));
   return null;
 }
 
@@ -193,7 +217,9 @@ function mcpHuman(name, input) {
   if (lname.includes('gmail')) {
     if (/search/.test(lname)) return { kind: 'mail', text: term ? `søkte i Gmail etter «${term}»` : 'sjekket innboksen' };
     if (/get_thread|read/.test(lname)) return { kind: 'mail', text: 'leste en e-posttråd' };
-    if (/draft/.test(lname)) return { kind: 'mail', text: 'skrev et e-postutkast' };
+    if (/list_drafts?/.test(lname)) return { kind: 'mail', text: 'så på utkast-listen' };
+    if (/create_draft/.test(lname)) return { kind: 'mail', text: 'skrev et e-postutkast' };
+    if (/draft/.test(lname)) return { kind: 'mail', text: 'jobbet med utkast' };
     if (/label/.test(lname)) return { kind: 'mail', text: 'sorterte e-post' };
     return { kind: 'mail', text: 'jobbet i Gmail' };
   }
@@ -274,7 +300,12 @@ async function main() {
     kind: h.kind,
     text: h.text,
     tool,
-    raw: { file: input.file_path, query: input.query || input.pattern, desc: input.description, detail: detailOf(tool, input) },
+    raw: {
+      file: input.file_path,
+      query: redactSecrets(input.query || input.pattern),
+      desc: redactSecrets(input.description),
+      detail: detailOf(tool, input),
+    },
   };
 
   // 1) lokal backup (instant, durabel)
