@@ -955,10 +955,8 @@ busCommand
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean }) => {
-    // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
-    // does not expand escapes, so they arrive at argv as 2-char literals and
-    // Telegram renders them as visible text. Normalize before send + log.
+  .option('--buttons <json>', 'Inline keyboard buttons as JSON array of rows. Each row is an array of {text, callback_data} objects. Example: \'[[{"text":"Ja","callback_data":"yes"}],[{"text":"Nei","callback_data":"no"}]]\'')
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean; buttons?: string }) => {
     message = message.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
     // Resolve bot token: agent .env first, then process.env
     const env = resolveEnv();
@@ -996,7 +994,17 @@ busCommand
         const result = await api.sendDocument(chatId, opts.file, message);
         sentMessageId = result?.result?.message_id ?? 0;
       } else {
-        const result = await api.sendMessage(chatId, message, undefined, {
+        let replyMarkup: object | undefined;
+        if (opts.buttons) {
+          try {
+            const keyboard = JSON.parse(opts.buttons);
+            replyMarkup = { inline_keyboard: keyboard };
+          } catch {
+            console.error('Invalid --buttons JSON');
+            process.exit(1);
+          }
+        }
+        const result = await api.sendMessage(chatId, message, replyMarkup, {
           parseMode: opts.plainText ? null : 'HTML',
         });
         sentMessageId = result?.result?.message_id ?? 0;

@@ -1,0 +1,25 @@
+module.exports = {
+  apps: [{
+    name: 'massivlust-draft-service',
+    script: 'src/index.js',
+    cwd: '/Users/max/cortextos/builds/massivlust-draft-service',
+    exec_mode: 'fork',
+    instances: 1,
+    autorestart: true,
+    max_memory_restart: '300M',
+    env: {
+      NODE_ENV: 'production',
+      PORT: '7778',
+      DRAFT_API_SECRET: 'a3f9c2e1b8d47f6a0e5c3d2b1a9f8e7d6c5b4a3f2e1d0c9b8a7f6e5d4c3b2a1',
+      GMAIL_API_URL: 'http://localhost:7777',
+      GMAIL_API_SECRET: '7745eae7b79665fa6ac1834441dd7f401823fd34f6ea9e3dddac53fa9c6e096d',
+      SUPABASE_URL: 'https://wnnrtmtgtzcwqobnnzyo.supabase.co',
+      SUPABASE_ANON_KEY: 'sb_publishable_K_ucitW1dHKAiN5wrwgOPQ_W9gU_Nod',
+    },
+    error_file: 'logs/error.log',
+    out_file: 'logs/out.log',
+    log_date_format: 'YYYY-MM-DD HH:mm:ss',
+    max_restarts: 20,
+    min_uptime: '30s',
+  }],
+};

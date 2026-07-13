@@ -37,6 +37,22 @@ export async function run({ mode = 'incremental', dryRun = false } = {}) {
           continue;
         }
 
+        // Skip if this TT ID is already owned by a different Supabase project
+        const alreadyOwned = (existing || []).find(e =>
+          String(e.tripletex_project_id) === String(tt.id) && e.id !== match.id
+        );
+        if (alreadyOwned) {
+          logger.info({ ttId: tt.id, ownedBy: alreadyOwned.id, wouldMatch: match.id }, 'Tripletex ID already assigned elsewhere — skipping');
+          skipped++;
+          continue;
+        }
+
+        // Skip if already correct
+        if (String(match.tripletex_project_id) === String(tt.id)) {
+          skipped++;
+          continue;
+        }
+
         if (dryRun) {
           logger.info({ ttId: tt.id, supabaseId: match.id, name: tt.name }, 'DRY-RUN would update');
           upserted++;

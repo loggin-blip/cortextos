@@ -113,6 +113,33 @@ export async function listFolder(folderId) {
   return searchFiles(`'${folderId}' in parents and trashed=false`);
 }
 
+export async function uploadFile({ folderId, name, mimeType, buffer, impersonateEmail }) {
+  const drive = getDriveClient(impersonateEmail);
+  const { Readable } = await import('stream');
+  const stream = Readable.from(buffer);
+  const res = await drive.files.create({
+    requestBody: { name, parents: [folderId], mimeType },
+    media: { mimeType, body: stream },
+    fields: 'id,name,mimeType,size,webViewLink,parents',
+    supportsAllDrives: true,
+  });
+  return res.data;
+}
+
+export async function createFolder({ parentFolderId, name, impersonateEmail }) {
+  const drive = getDriveClient(impersonateEmail);
+  const res = await drive.files.create({
+    requestBody: {
+      name,
+      parents: [parentFolderId],
+      mimeType: 'application/vnd.google-apps.folder',
+    },
+    fields: 'id,name,webViewLink,parents',
+    supportsAllDrives: true,
+  });
+  return res.data;
+}
+
 export async function listFolderFull(folderId) {
   const drive = getClient();
   const files = [];

@@ -23,7 +23,7 @@ from pathlib import Path
 SECRETS_ENV = Path("/Users/max/cortextos/orgs/westside-hq/secrets.env")
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-AGENT_BASE = Path("/Users/max/cortextos/orgs/westside-hq/agents")
+AGENT_BASE = Path("/Users/max/cortextos/orgs/massivlust/agents")
 ALEX_CHAT_ID = "8672356303"
 CORTEXTOS = "cortextos"
 

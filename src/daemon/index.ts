@@ -1,4 +1,5 @@
 import { AgentManager } from './agent-manager.js';
+import { DashboardBridge } from './dashboard-bridge.js';
 import { IPCServer } from './ipc-server.js';
 import { readdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 'fs';
 import { spawnSync } from 'child_process';
@@ -220,6 +221,7 @@ function handleFatal(
 class Daemon {
   private agentManager: AgentManager | null = null;
   private ipcServer: IPCServer | null = null;
+  private dashboardBridge: DashboardBridge | null = null;
   private instanceId: string;
   private ctxRoot: string;
 
@@ -266,11 +268,19 @@ class Daemon {
     // Discover and start agents
     await this.agentManager.discoverAndStart();
 
+    // Start dashboard → Cortex bridge: poller Supabase for dashboard-meldinger
+    // og injecter dem til riktig agent. Best-effort, krasjer aldri daemon.
+    this.dashboardBridge = new DashboardBridge(this.agentManager);
+    this.dashboardBridge.start();
+
     console.log(`[daemon] Running (pid: ${process.pid})`);
 
     // Handle shutdown signals
     const shutdown = async () => {
       console.log('[daemon] Shutting down...');
+      if (this.dashboardBridge) {
+        this.dashboardBridge.stop();
+      }
       try {
         if (this.agentManager) {
           await this.agentManager.stopAll();

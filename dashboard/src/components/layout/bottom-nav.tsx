@@ -21,33 +21,81 @@ import {
   IconTarget,
   IconX,
   IconNotes,
+  IconFolder,
+  IconUsers,
+  IconPhoto,
+  IconCoin,
+  IconUser,
+  IconVideo,
+  IconTerminal2,
 } from '@tabler/icons-react';
 import { cn } from '@/lib/utils';
 
-const mainTabs = [
-  { label: 'Overview', href: '/', icon: IconLayoutDashboard },
-  { label: 'Tasks', href: '/tasks', icon: IconListCheck },
-  { label: 'Approvals', href: '/approvals', icon: IconShieldCheck },
-  { label: 'Analytics', href: '/analytics', icon: IconChartDots3 },
-];
+type TabItem = { label: string; href: string; icon: React.ComponentType<{ size?: number; strokeWidth?: number }> };
 
-const morePages = [
-  { label: 'Agents', href: '/agents', icon: IconRobot },
-  { label: 'Comms', href: '/comms', icon: IconMessages },
-  { label: 'Activity', href: '/activity', icon: IconActivity },
-  { label: 'Knowledge Base', href: '/knowledge-base', icon: IconBook2 },
-  { label: 'Wiki', href: '/wiki', icon: IconNotes },
-  { label: 'Workflows', href: '/workflows', icon: IconClock },
-  { label: 'Strategy', href: '/strategy', icon: IconTarget },
-  { label: 'Experiments', href: '/experiments', icon: IconFlask },
-  { label: 'Skills', href: '/skills', icon: IconPuzzle },
-  { label: 'Settings', href: '/settings', icon: IconSettings },
-];
+function getMainTabs(org: string): TabItem[] {
+  switch (org) {
+    case 'massivlust':
+      return [
+        { label: 'Dashboard', href: '/massivlust', icon: IconLayoutDashboard },
+        { label: 'Prosjekter', href: '/massivlust/prosjekter', icon: IconFolder },
+        { label: 'Team', href: '/massivlust/team', icon: IconUsers },
+        { label: 'KS', href: '/massivlust/ks', icon: IconPhoto },
+      ];
+    case 'nordflo':
+      return [
+        { label: 'Dashboard', href: '/nordflo', icon: IconLayoutDashboard },
+      ];
+    case 'westside-hq':
+      return [
+        { label: 'Mission', href: '/', icon: IconLayoutDashboard },
+        { label: 'Tasks', href: '/tasks', icon: IconListCheck },
+        { label: 'Claude', href: '/claude', icon: IconTerminal2 },
+        { label: 'Approvals', href: '/approvals', icon: IconShieldCheck },
+      ];
+    default:
+      return [
+        { label: 'Overview', href: '/', icon: IconLayoutDashboard },
+        { label: 'Tasks', href: '/tasks', icon: IconListCheck },
+        { label: 'Approvals', href: '/approvals', icon: IconShieldCheck },
+        { label: 'Analytics', href: '/analytics', icon: IconChartDots3 },
+      ];
+  }
+}
+
+function getMorePages(org: string): TabItem[] {
+  switch (org) {
+    case 'massivlust':
+      return [
+        { label: 'Okonomi', href: '/massivlust/okonomi', icon: IconCoin },
+        { label: 'Min side', href: '/massivlust/min-side', icon: IconUser },
+        { label: 'Settings', href: '/settings', icon: IconSettings },
+      ];
+    case 'nordflo':
+      return [
+        { label: 'Settings', href: '/settings', icon: IconSettings },
+      ];
+    default:
+      return [
+        { label: 'Agents', href: '/agents', icon: IconRobot },
+        { label: 'Comms', href: '/comms', icon: IconMessages },
+        { label: 'Activity', href: '/activity', icon: IconActivity },
+        { label: 'Knowledge Base', href: '/knowledge-base', icon: IconBook2 },
+        { label: 'Workflows', href: '/workflows', icon: IconClock },
+        { label: 'Strategy', href: '/strategy', icon: IconTarget },
+        { label: 'Experiments', href: '/experiments', icon: IconFlask },
+        { label: 'Skills', href: '/skills', icon: IconPuzzle },
+        { label: 'Settings', href: '/settings', icon: IconSettings },
+      ];
+  }
+}
 
 export function BottomNav() {
   const pathname = usePathname();
   const [moreOpen, setMoreOpen] = useState(false);
   const { currentOrg } = useOrg();
+  const mainTabs = getMainTabs(currentOrg);
+  const morePages = getMorePages(currentOrg);
 
   function orgHref(href: string) {
     if (currentOrg && currentOrg !== 'all') {

@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""
+«Les alt»-inntak — fullt lokalt, gratis. Kjører på Mac Studio.
+Leser Drive-mapper → ekstraherer ALT (tekst/docx/xlsx/pdf-tekst, bilder+scannede
+PDF-er+tegninger via lokal vision-modell, IFC-metadata) → embedder lokalt (Ollama
+bge-m3) → ChromaDB (massivlust-docs) + kilde-register (Supabase).
+
+Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SA_KEY (sti til google-sa-key.json),
+     OLLAMA (default localhost:11434), EMBED_MODEL=bge-m3, VISION_MODEL=qwen2.5vl:7b
+Arg: <driveFolderId> [maxFiles]
+"""
+import os, sys, json, io, re, base64, urllib.request, time, pathlib
+import chromadb
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+
+OLLAMA = os.environ.get("OLLAMA", "http://localhost:11434")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
+VISION_MODEL = os.environ.get("VISION_MODEL", "qwen2.5vl:7b")
+USER = os.environ.get("WS_USER", "alex@massivlust.no")
+SENSITIVE_RX = re.compile(r"(lønn|salary|personnummer|arbeidsavtale|ansettelse|sykmeld|taushet)", re.I)
+
+# ── Ollama ───────────────────────────────────────────────────────────────────
+def _post(path, payload, timeout=300):
+    req = urllib.request.Request(OLLAMA + path, data=json.dumps(payload).encode(),
+                                 headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+def embed(text):
+    return _post("/api/embed", {"model": EMBED_MODEL, "input": text[:8000]})["embeddings"][0]
+
+def embed_batch(texts):
+    # ett HTTP-kall for alle chunks i en fil = ~5x raskere enn ett-og-ett
+    return _post("/api/embed", {"model": EMBED_MODEL, "input": [t[:8000] for t in texts]})["embeddings"]
+
+def describe_image(img_bytes):
+    b64 = base64.b64encode(img_bytes).decode()
+    out = _post("/api/generate", {
+        "model": VISION_MODEL,
+        "prompt": "Beskriv dette dokumentet/bildet/tegningen på norsk. Ta med all tekst, tall, mål, navn og hva det handler om. Vær konkret.",
+        "images": [b64], "stream": False,
+        # num_ctx 8192 holder rikelig for ett bilde + prompt og kutter KV-cache
+        # fra ~17GB (128k default) til ~7GB — kritisk for RAM-hodet paa Studio.
+        "options": {"num_ctx": 8192}, "keep_alive": "2m",
+    })
+    return out.get("response", "").strip()
+
+# ── Drive ────────────────────────────────────────────────────────────────────
+def drive_client():
+    creds = service_account.Credentials.from_service_account_file(
+        os.environ["SA_KEY"], scopes=["https://www.googleapis.com/auth/drive"], subject=USER)
+    return build("drive", "v3", credentials=creds)
+
+FIELDS = "files(id,name,mimeType,size,modifiedTime,webViewLink,parents),nextPageToken"
+
+def walk(drive, root, max_files):
+    out, q, seen = [], [root], {root}
+    while q and len(out) < max_files:
+        fid = q.pop(0)
+        tok = None
+        while True:
+            r = drive.files().list(q=f"'{fid}' in parents and trashed=false", fields=FIELDS,
+                                   pageSize=200, supportsAllDrives=True, includeItemsFromAllDrives=True,
+                                   corpora="allDrives", pageToken=tok).execute()
+            for f in r.get("files", []):
+                if f["mimeType"] == "application/vnd.google-apps.folder":
+                    if f["id"] not in seen:
+                        seen.add(f["id"]); q.append(f["id"])
+                else:
+                    out.append(f)
+                    if len(out) >= max_files: break
+            tok = r.get("nextPageToken")
+            if not tok or len(out) >= max_files: break
+    return out
+
+GOOGLE_EXPORT = {
+    "application/vnd.google-apps.document": ("text/plain", ".txt"),
+    "application/vnd.google-apps.spreadsheet": ("text/csv", ".csv"),
+    "application/vnd.google-apps.presentation": ("text/plain", ".txt"),
+}
+
+def download(drive, f):
+    mt = f["mimeType"]
+    if mt in GOOGLE_EXPORT:
+        data = drive.files().export(fileId=f["id"], mimeType=GOOGLE_EXPORT[mt][0]).execute()
+        return data, GOOGLE_EXPORT[mt][1]
+    if mt.startswith("application/vnd.google-apps"):
+        return None, None
+    buf = io.BytesIO()
+    dl = MediaIoBaseDownload(buf, drive.files().get_media(fileId=f["id"], supportsAllDrives=True))
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    ext = os.path.splitext(f["name"])[1].lower()
+    return buf.getvalue(), ext
+
+# ── ekstraksjon (les ALT) ────────────────────────────────────────────────────
+def extract(data, ext, mime, name):
+    """Returner liste av tekst-biter. Bruker vision for bilder/scannede PDF-er."""
+    try:
+        if mime.startswith("image/"):
+            return [describe_image(data)]
+        if ext in (".txt", ".csv", ".md", ".json", ".html", ".htm"):
+            return [data.decode("utf-8", "ignore")]
+        if ext == ".docx":
+            import docx
+            d = docx.Document(io.BytesIO(data))
+            return ["\n".join(p.text for p in d.paragraphs if p.text.strip())]
+        if ext in (".xlsx", ".xlsm"):
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+            rows = []
+            for ws in wb.worksheets:
+                rows.append(f"[ark: {ws.title}]")
+                for row in ws.iter_rows(values_only=True):
+                    cells = [str(c) for c in row if c is not None]
+                    if cells: rows.append(" | ".join(cells))
+            return ["\n".join(rows)]
+        if ext == ".pdf":
+            # 1) tekst via pypdf (virker overalt). 2) tomme/scannede sider →
+            # render + vision HVIS pymupdf finnes (ellers hopp over den siden).
+            chunks = []
+            try:
+                import fitz  # pymupdf — beste: tekst + render
+                doc = fitz.open(stream=data, filetype="pdf")
+                for page in doc:
+                    txt = page.get_text().strip()
+                    if len(txt) >= 40:
+                        chunks.append(txt)
+                    else:
+                        try:
+                            pix = page.get_pixmap(dpi=130)
+                            chunks.append(describe_image(pix.tobytes("png")))
+                        except Exception:
+                            pass
+            except ImportError:
+                from pypdf import PdfReader
+                rd = PdfReader(io.BytesIO(data))
+                for pg in rd.pages:
+                    t = (pg.extract_text() or "").strip()
+                    if len(t) >= 40:
+                        chunks.append(t)
+            return chunks or [name]
+        if ext == ".ifc":
+            txt = data.decode("utf-8", "ignore")
+            names = re.findall(r"IFC(?:PROJECT|SITE|BUILDING|BUILDINGSTOREY|SPACE)\('[^']*','[^']*','([^']*)'", txt)
+            kinds = re.findall(r"IFC([A-Z]+)\(", txt)
+            from collections import Counter
+            top = ", ".join(f"{k}:{n}" for k, n in Counter(kinds).most_common(15))
+            return [f"BIM-modell {name}. Navngitte elementer: {', '.join(dict.fromkeys(names))[:500]}. Elementtyper: {top}"]
+    except Exception as e:
+        print(f"    extract-feil {name}: {e}", file=sys.stderr)
+        return []
+    return []
+
+def chunk(text, size=1500):
+    text = (text or "").strip()
+    if not text: return []
+    return [text[i:i+size] for i in range(0, len(text), size)] or [text]
+
+# ── main ─────────────────────────────────────────────────────────────────────
+def main():
+    folder = sys.argv[1]
+    max_files = int(sys.argv[2]) if len(sys.argv) > 2 else 1000
+    project_id = sys.argv[3] if len(sys.argv) > 3 else None
+    drive = drive_client()
+    files = walk(drive, folder, max_files)
+    print(f"walk: {len(files)} filer i {folder}")
+
+    cc = chromadb.PersistentClient(path=str(pathlib.Path.home()/".mmrag"/"chromadb"))
+    col = cc.get_or_create_collection("massivlust-docs", metadata={"hnsw:space": "cosine"})
+
+    rows = []
+    n_ok = n_skip = n_chunks = 0
+    for f in files:
+        size = int(f.get("size", "0") or "0")
+        if size > 40*1024*1024:
+            n_skip += 1; continue
+        data, ext = download(drive, f)
+        if data is None:
+            n_skip += 1; continue
+        parts = extract(data, ext or "", f["mimeType"], f["name"])
+        chunks = [c for p in parts for c in chunk(p)]
+        chunks = [c for c in chunks if c.strip()]
+        if not chunks:
+            n_skip += 1; continue
+        scope = "sensitive" if SENSITIVE_RX.search(f["name"]) else "project"
+        base = f"{f['id']}__{re.sub(r'[^\\w.\\-æøåÆØÅ ]+','_', os.path.splitext(f['name'])[0])[:60].strip()}{ext or ''}"
+        # embed + lagre chunks
+        sel = chunks[:50]
+        ftype = "image" if f["mimeType"].startswith("image/") else ("pdf_page" if ext==".pdf" else "text")
+        ids = [f"{base}#{ci}" for ci in range(len(sel))]
+        docs = sel
+        metas = [{"filename": base, "type": ftype, "chunk_index": ci, "access_scope": scope} for ci in range(len(sel))]
+        embs = embed_batch(sel)
+        # erstatt evt. gamle chunks for denne fila
+        try: col.delete(where={"filename": base})
+        except Exception: pass
+        col.add(ids=ids, documents=docs, metadatas=metas, embeddings=embs)
+        n_ok += 1; n_chunks += len(ids)
+        rows.append({"org_id":"massivlust","collection":"massivlust-docs" if scope=="project" else "massivlust-sensitive",
+                     "source_type":"drive","staged_basename":base,"drive_file_id":f["id"],
+                     "parent_folder_id":(f.get("parents") or [None])[0],"web_view_link":f.get("webViewLink"),
+                     "project_id":project_id,"title":f["name"],"mime_type":f["mimeType"],"access_scope":scope,
+                     "file_modified_at":f.get("modifiedTime"),"chunk_count":len(ids)})
+        if n_ok % 10 == 0: print(f"  {n_ok} filer, {n_chunks} chunks…", flush=True)
+
+    # kilde-register → Supabase (REST upsert)
+    if rows:
+        url = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1/massivlust_kb_sources?on_conflict=source_type,drive_file_id"
+        key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+        for i in range(0, len(rows), 100):
+            req = urllib.request.Request(url, data=json.dumps(rows[i:i+100]).encode(),
+                headers={"apikey":key,"authorization":f"Bearer {key}","content-type":"application/json",
+                         "prefer":"resolution=merge-duplicates"}, method="POST")
+            try: urllib.request.urlopen(req, timeout=60).read()
+            except Exception as e: print(f"  kilde-register-feil: {e}", file=sys.stderr)
+    print(f"FERDIG: {n_ok} filer lest, {n_chunks} chunks, {n_skip} hoppet over. Collection: {col.count()}")
+
+if __name__ == "__main__":
+    main()

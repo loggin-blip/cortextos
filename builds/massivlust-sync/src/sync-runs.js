@@ -46,9 +46,10 @@ export async function getLastCursor(source) {
     .from('massivlust_sync_runs')
     .select('cursor')
     .eq('source', source)
-    .eq('status', 'success')
+    .in('status', ['success', 'partial'])
+    .not('cursor', 'is', null)
     .order('ended_at', { ascending: false })
     .limit(1)
-    .single();
+    .maybeSingle();
   return data?.cursor || null;
 }

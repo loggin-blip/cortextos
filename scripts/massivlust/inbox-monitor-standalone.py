@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).parent
-VENV_PYTHON = str(Path("/Users/max/cortextos/orgs/westside-hq/agents/ml-prosjektleder/scripts/.venv/bin/python3"))
+VENV_PYTHON = str(Path("/Users/max/cortextos/knowledge-base/venv/bin/python3"))
 MONITOR_SCRIPT = str(SCRIPTS_DIR / "gmail_monitor.py")
 CORTEXTOS = "cortextos"
 
