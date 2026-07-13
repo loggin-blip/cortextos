@@ -9,7 +9,7 @@ Setter kb_indexed_at = now() når ferdig.
 Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, OLLAMA (default localhost:11434)
 Arg: --mode=mail|attachment  --limit=N
 """
-import os, sys, json, re, urllib.request, pathlib, argparse
+import os, sys, json, re, urllib.request, pathlib, argparse, fcntl
 from datetime import datetime, timezone
 
 import chromadb
@@ -23,6 +23,7 @@ SUPA_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPA_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
 CHROMA_PATH = str(pathlib.Path.home() / ".mmrag" / "chromadb")
+CHROMA_LOCK = pathlib.Path.home() / ".mmrag" / "chroma.lock"
 
 SENSITIVE_RX = re.compile(
     r"(lønn|salary|personnummer|fødselsnummer|arbeidsavtale|ansettelse|oppsigelse|"
@@ -382,10 +383,17 @@ def main():
     p.add_argument("--mode", choices=["mail", "attachment", "both"], default="both")
     p.add_argument("--limit", type=int, default=50)
     a = p.parse_args()
-    if a.mode in ("mail", "both"):
-        process_mails(a.limit)
-    if a.mode in ("attachment", "both"):
-        process_attachments(a.limit)
+    CHROMA_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(CHROMA_LOCK, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)  # block until nightly sync releases
+        if a.mode in ("mail", "both"):
+            process_mails(a.limit)
+        if a.mode in ("attachment", "both"):
+            process_attachments(a.limit)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
 
 
 if __name__ == "__main__":
