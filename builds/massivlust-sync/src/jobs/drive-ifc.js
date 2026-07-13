@@ -37,6 +37,15 @@ function matchFileToProject(file, projects) {
 }
 
 export async function run({ mode = 'incremental', dryRun = false } = {}) {
+  // Clean up stale 'running' records left by crashed/hung previous runs
+  const staleThreshold = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  await supabase
+    .from('massivlust_sync_runs')
+    .update({ status: 'error', error_message: 'abandoned: new run started', ended_at: new Date().toISOString() })
+    .eq('source', 'drive_ifc')
+    .eq('status', 'running')
+    .lt('started_at', staleThreshold);
+
   const runId = await syncRuns.start({ source: 'drive_ifc' });
 
   try {
