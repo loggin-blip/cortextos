@@ -54,15 +54,28 @@ export async function run({ mode = 'incremental', dryRun = false } = {}) {
 
     logger.info({ totalImages: imageResults.length }, 'Total images found across all folders');
 
+    const { data: existingRows, error: fetchErr } = await supabase
+      .from('massivlust_ks_bilder')
+      .select('drive_file_id, dato, prosjekt_id, omrade');
+    if (fetchErr) throw fetchErr;
+    const existingMap = new Map((existingRows || []).map(r => [r.drive_file_id, r]));
+
     let upserted = 0, skipped = 0, failed = 0;
 
     for (const { file, projectId, folderKind } of imageResults) {
       try {
+        const dato = file.modifiedTime ? file.modifiedTime.slice(0, 10) : new Date().toISOString().slice(0, 10);
+        const existing = existingMap.get(file.id);
+        if (existing && existing.dato === dato && existing.prosjekt_id === projectId && existing.omrade === folderKind) {
+          skipped++;
+          continue;
+        }
+
         const row = {
           drive_file_id: file.id,
           prosjekt_id: projectId,
           omrade: folderKind,
-          dato: file.modifiedTime ? file.modifiedTime.slice(0, 10) : new Date().toISOString().slice(0, 10),
+          dato,
           bilde_url: `https://drive.google.com/file/d/${file.id}/view`,
           org_id: 'massivlust',
           drive_synced_at: new Date().toISOString(),
