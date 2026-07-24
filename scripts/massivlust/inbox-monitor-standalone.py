@@ -42,12 +42,40 @@ def bus_cmd(args: list[str]) -> str:
     return result.stdout.strip()
 
 
+def handle_pl(emails: list[dict], agent_name: str, employee_email: str):
+    """Generic handler for PL agents (eivind, vegard) — proactive mail notification only."""
+    for email in emails:
+        subject = email.get("subject", "")
+        from_addr = email.get("from_email", "")
+        snippet = email.get("snippet", "")[:80]
+        gmail_id = email.get("id", "")
+        thread_id = email.get("thread_id", gmail_id)
+
+        subject_lower = subject.lower()
+        is_bounce = (
+            "mailer-daemon" in from_addr.lower() or
+            any(kw in subject_lower for kw in ["delivery status", "undelivered", "undeliverable", "mail delivery"])
+        )
+
+        if not is_bounce:
+            notif = (
+                f"MAIL_NOTIFICATION\n"
+                f"thread_id: {thread_id}\n"
+                f"from: {from_addr}\n"
+                f"subject: {subject}\n"
+                f"snippet: {snippet}"
+            )
+            bus_cmd(["send-message", agent_name, "normal", notif])
+            print(f"  -> {agent_name}: MAIL_NOTIFICATION from {from_addr}")
+
+
 def handle_martin(emails: list[dict]):
     for email in emails:
         subject = email.get("subject", "")
         from_addr = email.get("from_email", "")
         snippet = email.get("snippet", "")[:80]
         gmail_id = email.get("id", "")
+        thread_id = email.get("thread_id", gmail_id)
 
         subject_lower = subject.lower()
         if any(kw in subject_lower for kw in [
@@ -80,6 +108,18 @@ def handle_martin(emails: list[dict]):
         )
         bus_cmd(["send-message", "massivlust-team", "normal", msg])
         print(f"  -> Jensen: {category} from {from_addr}")
+
+        # Proactive mail intelligence: notify martin's agent for actionable emails
+        if category != "BOUNCE":
+            notif = (
+                f"MAIL_NOTIFICATION\n"
+                f"thread_id: {thread_id}\n"
+                f"from: {from_addr}\n"
+                f"subject: {subject}\n"
+                f"snippet: {snippet}"
+            )
+            bus_cmd(["send-message", "martin-thorvaldsen-venedik", "normal", notif])
+            print(f"  -> martin-agent: MAIL_NOTIFICATION from {from_addr}")
 
 
 def handle_alex(emails: list[dict]):
@@ -117,6 +157,18 @@ def handle_alex(emails: list[dict]):
             bus_cmd(["send-telegram", ALEX_CHAT_ID, tg_msg])
             print(f"  -> Alex TG: GENERAL from {from_addr}")
 
+        # Proactive mail intelligence: notify kaptein for all non-automated emails
+        thread_id = email.get("thread_id", gmail_id)
+        notif = (
+            f"MAIL_NOTIFICATION\n"
+            f"thread_id: {thread_id}\n"
+            f"from: {from_addr}\n"
+            f"subject: {subject}\n"
+            f"snippet: {snippet}"
+        )
+        bus_cmd(["send-message", "kaptein-massivlust", "normal", notif])
+        print(f"  -> kaptein: MAIL_NOTIFICATION from {from_addr}")
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -142,6 +194,10 @@ def main():
         handle_martin(emails)
     elif args.user == "alex@massivlust.no":
         handle_alex(emails)
+    elif args.user == "eivind@massivlust.no":
+        handle_pl(emails, "eivind-massivlust", "eivind@massivlust.no")
+    elif args.user == "vegard@massivlust.no":
+        handle_pl(emails, "vegard-massivlust", "vegard@massivlust.no")
     else:
         print(f"No handler for {args.user}", file=sys.stderr)
         sys.exit(1)

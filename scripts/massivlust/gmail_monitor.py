@@ -40,6 +40,32 @@ USER_CONFIGS = {
             "noreply@google.com",
         ],
     },
+    "eivind@massivlust.no": {
+        "mode": "read_all",
+        "denylist_senders": [
+            "temu",
+            "hybel.no",
+            "newsletter",
+            "nyhetsbrev",
+            "promo@",
+            "marketing@",
+            "calendar-notification@google.com",
+            "noreply@google.com",
+        ],
+    },
+    "vegard@massivlust.no": {
+        "mode": "read_all",
+        "denylist_senders": [
+            "temu",
+            "hybel.no",
+            "newsletter",
+            "nyhetsbrev",
+            "promo@",
+            "marketing@",
+            "calendar-notification@google.com",
+            "noreply@google.com",
+        ],
+    },
     "martin@massivlust.no": {
         # Martin = kompetanseansvarlig. Vil fange diplomer (innkommende fra mottakers)
         # + bouncer (mailer-daemon) + SfS-relatert korrespondanse.
@@ -263,6 +289,7 @@ def check_new_emails(target_user: str):
         alerts.append({
             "mailbox": target_user,
             "id": msg_meta["id"],
+            "thread_id": msg_meta.get("threadId", msg_meta["id"]),
             "from": sender_raw,
             "from_email": sender_email,
             "subject": subject,
