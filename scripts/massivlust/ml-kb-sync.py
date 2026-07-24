@@ -32,6 +32,7 @@ HOME         = Path.home()
 SYNC_DIR     = HOME / ".cortextos" / "ml-kb-sync"
 PAUSE_FILE   = SYNC_DIR / "PAUSE"
 LOCK_FILE    = SYNC_DIR / "ml-kb-sync.lock"
+CHROMA_LOCK  = HOME / ".mmrag" / "chroma.lock"
 VENV_PY      = HOME / "cortextos" / "knowledge-base" / "venv" / "bin" / "python3"
 HARVEST_CJS  = HOME / "mail-ab-test" / "mailkb-harvest.cjs"
 CLASSIFY_CJS = HOME / "mail-ab-test" / "mailkb-classify.cjs"
@@ -136,6 +137,19 @@ def embed_bge(text):
         headers={"content-type": "application/json"})
     with urllib.request.urlopen(req, timeout=120) as r:
         return json.loads(r.read())["embeddings"][0]
+
+def embed_bge_batch(texts, batch_size=64):
+    """Batch embed texts — returns list of embedding vectors in same order."""
+    out = []
+    for i in range(0, len(texts), batch_size):
+        batch = [t[:8000] for t in texts[i:i+batch_size]]
+        req = urllib.request.Request(
+            OLLAMA + "/api/embed",
+            data=json.dumps({"model": EMBED_MODEL, "input": batch}).encode(),
+            headers={"content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=300) as r:
+            out.extend(json.loads(r.read())["embeddings"])
+    return out
 
 # ── Text extraction (text-only, no vision — same as studio_ingest TEXT_ONLY=1) ──
 def extract_text(data: bytes, ext: str, mime: str, name: str) -> list[str]:
@@ -383,10 +397,25 @@ def sync_drive(dry_run, limit, log):
 
     n_ok = n_fail = n_chunks_total = 0
     kb_source_rows = []
+    T_DRIVE_START = time.time()
+    MAX_DRIVE_S = int(os.environ.get("ML_MAX_DRIVE_S", "6000"))  # 100 min hard stop
 
     for f in stale_files:
+        if time.time() - T_DRIVE_START > MAX_DRIVE_S:
+            log_info(log, f"drive: hard stop after {MAX_DRIVE_S}s — {n_ok} embedded so far")
+            break
+
         mt = f["mimeType"]
         if mt in SKIP_MIME:
+            continue
+
+        # Skip known binary MIME types before downloading
+        if mt.startswith(("image/", "video/", "audio/")):
+            continue
+
+        # Skip known binary extensions WITHOUT downloading (avoids 60-90s download per image)
+        _, fext = os.path.splitext(f.get("name", ""))
+        if fext.lower() in SKIP_EXT:
             continue
 
         sensitive = bool(SENSITIVE_RX.search(f.get("name", "")))
@@ -402,6 +431,19 @@ def sync_drive(dry_run, limit, log):
         parts = extract_text(data, ext, mt, f["name"])
         if not parts:
             log_info(log, f"drive: no text extracted from {f['name']}, skipping")
+            # Write chunk_count=0 tombstone so this file isn't retried unless modified in Drive
+            kb_source_rows.append({
+                "org_id": ORG_ID, "source_type": "drive",
+                "drive_file_id": f["id"], "staged_basename": re.sub(r'[^\w\-. ]', '_', f.get("name",""))[:180],
+                "title": f.get("name"), "mime_type": mt,
+                "collection": COLLECTION, "access_scope": "project",
+                "file_modified_at": f.get("modifiedTime"),
+                "web_view_link": f.get("webViewLink"),
+                "parent_folder_id": (f.get("parents") or [None])[0],
+                "chunk_count": 0,
+                "ingested_at": datetime.datetime.utcnow().isoformat() + "Z",
+                "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+            })
             continue
 
         chunks = [c for p in parts for c in chunk_text(p)]
@@ -447,7 +489,7 @@ def sync_drive(dry_run, limit, log):
             # Flush every 50 files so kb_sources counter increments visibly
             if len(kb_source_rows) >= 50:
                 try:
-                    supa_upsert("massivlust_kb_sources", ["source_type", "drive_file_id"], kb_source_rows)
+                    supa_upsert("massivlust_kb_sources", ["drive_file_id", "org_id"], kb_source_rows)
                     kb_source_rows = []
                 except Exception as flush_err:
                     log_info(log, f"drive: kb_sources flush error (will retry at end): {flush_err}")
@@ -457,7 +499,7 @@ def sync_drive(dry_run, limit, log):
             n_fail += 1
 
     if kb_source_rows:
-        supa_upsert("massivlust_kb_sources", ["source_type", "drive_file_id"], kb_source_rows)
+        supa_upsert("massivlust_kb_sources", ["drive_file_id", "org_id"], kb_source_rows)
 
     return {
         "scanned": len(all_files),
@@ -468,6 +510,150 @@ def sync_drive(dry_run, limit, log):
         "embed_model": EMBED_MODEL,
         "collection": COLLECTION,
     }
+
+# ── File metadata index ──────────────────────────────────────────────────────
+def sync_file_metadata(dry_run: bool, log) -> dict:
+    """Metadata-index ALL Drive files by name+path+project+type for name/origin search."""
+    import chromadb as chromadb_mod
+
+    # Fetch all Drive files from unclassified_files
+    rows = supa_get_all(
+        "massivlust_unclassified_files",
+        "select=file_name,mime_type,drive_file_id,current_drive_folder_path,"
+        "current_drive_folder_name,document_type,classified_project_id,updated_at"
+        "&drive_file_id=not.is.null"
+        "&source_type=eq.drive"
+    )
+    # Filter AppleDouble junk + missing names
+    rows = [r for r in rows
+            if r.get("drive_file_id") and r.get("file_name")
+            and not r["file_name"].startswith("._")]
+    log_info(log, f"file_meta: {len(rows)} Drive files to consider")
+
+    # Project name map
+    projects = supa_get_all("massivlust_projects", "select=id,name")
+    proj_map = {p["id"]: p["name"] for p in projects}
+
+    # Already-indexed entries from kb_sources
+    existing_rows = supa_get_all(
+        "massivlust_kb_sources",
+        "select=drive_file_id,ingested_at&source_type=eq.file_metadata"
+    )
+    existing = {er["drive_file_id"]: er.get("ingested_at") for er in existing_rows}
+
+    # Determine what needs (re-)indexing
+    to_index = []
+    for r in rows:
+        fid = r["drive_file_id"]
+        if fid not in existing:
+            to_index.append(r)
+        else:
+            try:
+                t_upd = datetime.datetime.fromisoformat(r["updated_at"].replace("Z", "+00:00"))
+                t_ing = datetime.datetime.fromisoformat(existing[fid].replace("Z", "+00:00"))
+                if t_upd > t_ing:
+                    to_index.append(r)
+            except Exception:
+                pass
+
+    skipped = len(rows) - len(to_index)
+    log_info(log, f"file_meta: {len(to_index)} new/changed, {skipped} already indexed")
+
+    if dry_run:
+        log_info(log, f"file_meta: dry-run — would embed {len(to_index)} files")
+        return {"total": len(rows), "staged": 0, "skipped": skipped, "to_index": len(to_index)}
+
+    if not to_index:
+        return {"total": len(rows), "staged": 0, "skipped": skipped}
+
+    chroma_client = chromadb_mod.PersistentClient(path=CHROMA_PATH)
+    col = chroma_client.get_or_create_collection(COLLECTION)
+
+    n_ok, n_fail = 0, 0
+    kb_source_rows = []
+    BATCH = 128  # embed N files per Ollama call
+
+    for batch_start in range(0, len(to_index), BATCH):
+        batch = to_index[batch_start:batch_start + BATCH]
+
+        # Build content strings for the batch
+        contents, doc_ids, metas_list, weblinks_list = [], [], [], []
+        for r in batch:
+            fid    = r["drive_file_id"]
+            fname  = r["file_name"]
+            folder = r.get("current_drive_folder_path") or r.get("current_drive_folder_name") or ""
+            dtype  = r.get("document_type") or ""
+            proj   = proj_map.get(r.get("classified_project_id") or "", "") or ""
+            weblink = f"https://drive.google.com/file/d/{fid}/view"
+
+            parts = [f"Filnavn: {fname}"]
+            if folder:
+                parts.append(f"Mappe: {folder}")
+            if proj:
+                parts.append(f"Prosjekt: {proj}")
+            if dtype:
+                parts.append(f"Dokumenttype: {dtype}")
+            content = "\n".join(parts)
+
+            contents.append(content)
+            doc_ids.append(f"file_meta_{fid}")
+            metas_list.append({
+                "filename":      fname,
+                "type":          "file_metadata",
+                "folder_path":   folder[:500],
+                "document_type": dtype,
+                "web_view_link": weblink,
+                "access_scope":  "project",
+            })
+            weblinks_list.append(weblink)
+
+        try:
+            embs = embed_bge_batch(contents)
+        except Exception as e:
+            log_info(log, f"file_meta: batch embed error at {batch_start}: {e}")
+            n_fail += len(batch)
+            continue
+
+        # Remove stale IDs + bulk-add to ChromaDB
+        try:
+            col.delete(ids=doc_ids)
+        except Exception:
+            pass
+        col.add(ids=doc_ids, documents=contents, metadatas=metas_list, embeddings=embs)
+
+        for i, r in enumerate(batch):
+            n_ok += 1
+            kb_source_rows.append({
+                "org_id":          ORG_ID,
+                "source_type":     "file_metadata",
+                "drive_file_id":   r["drive_file_id"],
+                "staged_basename": doc_ids[i],
+                "title":           r["file_name"],
+                "mime_type":       r.get("mime_type", ""),
+                "collection":      COLLECTION,
+                "access_scope":    "project",
+                "web_view_link":   weblinks_list[i],
+                "ingested_at":     datetime.datetime.utcnow().isoformat() + "Z",
+                "updated_at":      datetime.datetime.utcnow().isoformat() + "Z",
+            })
+
+        # Flush kb_sources every ~500 files
+        if len(kb_source_rows) >= 500:
+            try:
+                supa_upsert("massivlust_kb_sources",
+                            ["drive_file_id", "org_id"], kb_source_rows)
+                kb_source_rows = []
+                log_info(log, f"file_meta: {n_ok}/{len(to_index)} embedded …")
+            except Exception as flush_err:
+                log_info(log, f"file_meta: flush error: {flush_err}")
+
+    if kb_source_rows:
+        supa_upsert("massivlust_kb_sources",
+                    ["drive_file_id", "org_id"], kb_source_rows)
+
+    log_info(log, f"file_meta: done — {n_ok} embedded, {n_fail} failed, {skipped} skipped")
+    return {"total": len(rows), "staged": n_ok, "failed": n_fail, "skipped": skipped}
+
 
 # ── Mail sync ────────────────────────────────────────────────────────────────
 def sync_mail(dry_run, log):
@@ -519,6 +705,9 @@ def main():
                     help="Report gate decisions without embedding")
     ap.add_argument("--skip-drive", action="store_true")
     ap.add_argument("--skip-mail", action="store_true")
+    ap.add_argument("--skip-file-metadata", action="store_true")
+    ap.add_argument("--only-file-metadata", action="store_true",
+                    help="Run only the file-metadata pass (fast test)")
     ap.add_argument("--limit", type=int, default=0,
                     help="Max Drive files to embed (0=unlimited)")
     args = ap.parse_args()
@@ -538,6 +727,10 @@ def main():
         print("Another ml-kb-sync instance is running — exiting", flush=True)
         sys.exit(0)
 
+    CHROMA_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    chroma_lock_fd = open(CHROMA_LOCK, "w")
+    fcntl.flock(chroma_lock_fd, fcntl.LOCK_EX)  # wait for any ongoing embed batch
+
     mode = "DRY-RUN" if args.dry_run else "LIVE"
     log_info(log, f"=== ml-kb-sync START [{mode}] ===")
 
@@ -545,12 +738,17 @@ def main():
     result = {"date": today, "mode": mode, "drive": {}, "mail": {}}
 
     try:
-        if not args.skip_drive:
+        if not args.skip_drive and not args.only_file_metadata:
             log_info(log, "--- Drive part ---")
             result["drive"] = sync_drive(args.dry_run, args.limit, log)
             log_info(log, f"drive result: {result['drive']}")
 
-        if not args.skip_mail:
+        if not args.skip_file_metadata:
+            log_info(log, "--- File metadata part ---")
+            result["file_metadata"] = sync_file_metadata(args.dry_run, log)
+            log_info(log, f"file_metadata result: {result['file_metadata']}")
+
+        if not args.skip_mail and not args.only_file_metadata:
             log_info(log, "--- Mail part ---")
             result["mail"] = sync_mail(args.dry_run, log)
             log_info(log, f"mail result: {result['mail']}")
@@ -564,6 +762,8 @@ def main():
         log_info(log, f"=== ml-kb-sync DONE in {elapsed}s ===")
         with open(log, "a") as f:
             f.write(json.dumps(result) + "\n")
+        fcntl.flock(chroma_lock_fd, fcntl.LOCK_UN)
+        chroma_lock_fd.close()
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
 
