@@ -33,11 +33,12 @@ HUMAN_TASK_ID=$(cortextos bus create-task \
 
 echo "HUMAN_TASK_ID=$HUMAN_TASK_ID"
 
-# 2. Block your own task on it
+# 2. Block your own task on it — update-task auto-emits task_updated,
+#    no manual log-event needed
 cortextos bus update-task "$YOUR_TASK_ID" blocked
-cortextos bus log-event task task_blocked info --meta "{\"task_id\":\"$YOUR_TASK_ID\",\"blocked_by\":\"$HUMAN_TASK_ID\",\"reason\":\"human dependency\"}"
 
-# 3. Notify orchestrator to surface in next briefing
+# 3. Notify orchestrator to surface in next briefing — send-message auto-emits
+#    agent_message_sent, no manual log-event needed
 cortextos bus send-message "$CTX_ORCHESTRATOR_AGENT" normal \
   "Human task created: [HUMAN] <title> — needed before I can proceed with <your task title>"
 

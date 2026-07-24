@@ -1,12 +1,14 @@
 ---
 name: tasks
-description: "You are about to start any meaningful piece of work — a research task, a build, a draft, a deployment, anything with a deliverable. Before you begin, create a task. During the work, mark it in_progress and write WORKING ON to daily memory. When done, complete it with a result summary and log a task_completed event. If you are blocked, set the task to blocked with the reason. If a human needs to do something first, assign it to them. Without a task, your work is invisible to the dashboard and the user."
+description: "You are about to start any meaningful piece of work — a research task, a build, a draft, a deployment, anything with a deliverable. Before you begin, create a task. During the work, mark it in_progress and write WORKING ON to daily memory. When done, complete it with a result summary and an outcome (success or failure). If you are blocked, set the task to blocked with the reason. If a human needs to do something first, assign it to them. Without a task, your work is invisible to the dashboard and the user."
 triggers: ["create task", "start task", "new task", "track work", "log work", "task system", "task workflow", "mark in progress", "complete task", "task blocked", "assign task", "list tasks", "task queue", "pending tasks", "my tasks", "work item", "deliverable", "project task", "task management", "task lifecycle"]
 ---
 
 # Task System
 
 Every significant piece of work must have a corresponding task. Tasks enable coordination, accountability, and measurable progress.
+
+**Auto-emit:** `create-task`, `update-task`, and `complete-task` all emit their own bus events (`task_created`, `task_updated`, `task_completed`). Do NOT follow them with a manual `log-event task ...` — that produces duplicates.
 
 ## Task Types
 
@@ -29,13 +31,16 @@ cortextos bus update-task <task_id> in_progress
 
 ### 4. Complete
 ```bash
+# Success
 cortextos bus complete-task <task_id> --result "[output summary]"
+
+# Failure — the task shipped but did not achieve its goal (deploy attempted but failed,
+# report drafted but blocked by missing data, etc.). Feeds KPI dashboards so failure
+# doesn't silently count as success.
+cortextos bus complete-task <task_id> --result "[what failed and why]" --outcome failure
 ```
 
-### 5. Log KPI (if measurable)
-```bash
-cortextos bus log-event task task_completed info --meta '{"task_id":"ID","kpi_key":"metric_name","value":1}'
-```
+`--outcome` defaults to `success` when omitted. The value is written to task.outcome and into the auto-emitted `task_completed` event's meta.
 
 ## The `needs_approval` Field
 
@@ -51,8 +56,7 @@ Tasks with `needs_approval: true` create an approval item that must be reviewed 
 | Create | `cortextos bus create-task "<title>" --desc "<desc>" [--assignee <a>] [--priority <p>]` |
 | List | `cortextos bus list-tasks [--status S] [--agent A] [--priority P]` |
 | Update | `cortextos bus update-task <id> <status>` |
-| Complete | `cortextos bus complete-task <id> --result "[summary]"` |
-| Log event | `cortextos bus log-event <category> <event> <severity> --meta '[json]'` |
+| Complete | `cortextos bus complete-task <id> --result "[summary]" [--outcome success\|failure]` |
 
 **Statuses:** pending, in_progress, blocked, completed
 
@@ -63,4 +67,4 @@ Tasks with `needs_approval: true` create an approval item that must be reviewed 
 - **Always create before starting** - ensures tracking and coordination
 - **Be specific** - clear titles, descriptions with success criteria
 - **Complete thoroughly** - include what was accomplished and where outputs are
-- **Log KPIs** - when work advances a measurable goal
+- **Set --outcome failure** when the task delivered but didn't succeed — KPI accuracy depends on it

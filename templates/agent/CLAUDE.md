@@ -29,7 +29,7 @@ See AGENTS.md for the full 13-step session start checklist. Key steps:
 8. If resuming a task, query KB: `cortextos bus kb-query "<task topic>" --org $CTX_ORG`
 9. Check inbox: `cortextos bus check-inbox`
 10. Update heartbeat: `cortextos bus update-heartbeat "online"`
-11. Log session start: `cortextos bus log-event action session_start info --meta '{"agent":"'$CTX_AGENT_NAME'"}'`
+11. Log session start: `cortextos bus log-event action session_start info` (bus auto-injects agent/org/timestamp)
 12. Write session start entry to daily memory
 13. Send full online status — **only AFTER crons are confirmed set**
 
@@ -37,10 +37,11 @@ See AGENTS.md for the full 13-step session start checklist. Key steps:
 
 Every significant piece of work gets a task. See `.claude/skills/tasks/SKILL.md` for full reference.
 
-1. **Create**: `cortextos bus create-task "<title>" --desc "<desc>"`
-2. **Start**: `cortextos bus update-task <id> in_progress`
-3. **Complete**: `cortextos bus complete-task <id> --result "[summary]"`
-4. **Log KPI**: `cortextos bus log-event task task_completed info --meta '{"task_id":"ID"}'`
+1. **Create**: `cortextos bus create-task "<title>" --desc "<desc>"` — auto-emits `task_created`
+2. **Start**: `cortextos bus update-task <id> in_progress` — auto-emits `task_updated` (with from/to)
+3. **Complete**: `cortextos bus complete-task <id> --result "[summary]" [--outcome success|failure]` — auto-emits `task_completed` (with outcome)
+
+Do NOT follow these with a manual `log-event task ...` — that produces duplicates. `--outcome` defaults to `success`; set `failure` when the task shipped but did not achieve its goal (KPI accuracy depends on it).
 
 CONSEQUENCE: Tasks without creation = invisible on dashboard. Your effectiveness score will be 0%.
 TARGET: Every significant piece of work (>10 minutes) = at least 1 task created.
@@ -67,17 +68,34 @@ TARGET: >= 3 memory entries per session.
 
 ---
 
-## Mandatory Event Logging
+## Event Logging
 
-Log significant events so the Activity feed shows what's happening.
+Most events are auto-emitted by the bus. `create-task`, `update-task`, `complete-task`, `send-message`, `create-approval`, `update-approval`, and `update-heartbeat` all emit their own events. Do NOT double-log those — it produces duplicates with mismatched shapes and breaks dashboard filters.
+
+You only need `log-event` for things bus can't derive:
 
 ```bash
-cortextos bus log-event action session_start info --meta '{"agent":"'$CTX_AGENT_NAME'"}'
-cortextos bus log-event action task_completed info --meta '{"task_id":"<id>","agent":"'$CTX_AGENT_NAME'"}'
+# Session boundaries (bus sees process up, not conversation start/end)
+cortextos bus log-event action session_start info
+cortextos bus log-event action session_end info
+
+# Real errors (not caught-and-recovered flows)
+cortextos bus log-event error <operation>_failed error --meta '{"error":"<msg>"}'
+
+# Milestones (business/project meaning)
+cortextos bus log-event milestone <name> info --meta '{"context":"<what happened>"}'
+
+# Orchestrator coordination events (bus doesn't know these differ from plain send-message)
+cortextos bus log-event action task_dispatched info --meta '{"to":"<agent>","task":"<title>"}'
+cortextos bus log-event action briefing_sent info --meta '{"type":"morning_review"}'
 ```
 
-CONSEQUENCE: Events without logging are invisible in the Activity feed.
-TARGET: >= 3 events per active session.
+**Never put `"agent":"..."` in `--meta`** — bus already injects agent/org/timestamp into every envelope. Unknown `event_name` values produce a stderr warn — canonical names live in `src/utils/validate.ts:KNOWN_EVENT_NAMES`.
+
+See `.claude/skills/event-logging/SKILL.md` for the full table of auto-emitted vs. manual events.
+
+CONSEQUENCE: Duplicate manual logs pollute the Activity feed and skew KPIs.
+TARGET: 1 event at session start, 1 at session end, plus real errors/milestones/coordination.
 
 ---
 
@@ -185,7 +203,11 @@ Sessions auto-restart with `--continue` every ~71 hours. On context exhaustion, 
 
 - **.claude/skills/comms/** - Message handling reference (Telegram + agent inbox formats)
 - **.claude/skills/cron-management/** - Cron setup, persistence, and troubleshooting
-- **.claude/skills/tasks/** - Task creation, lifecycle, and KPI logging
+- **.claude/skills/tasks/** - Task creation and lifecycle (auto-emits task events)
+- **.claude/skills/event-logging/** - When to log manually vs. rely on bus auto-emit
+- **.claude/skills/heartbeat/** - Activity = liveness; explicit update sets status text
+- **.claude/skills/approvals/** - External/irreversible actions require approval first
+- **.claude/skills/human-tasks/** - When you can't do it — human capability blocker
 
 ---
 

@@ -43,8 +43,9 @@ Categories: `external-comms` | `financial` | `deployment` | `data-deletion` | `o
 
 ```bash
 cortextos bus update-task "$TASK_ID" blocked
-cortextos bus log-event task task_blocked info --meta "{\"task_id\":\"$TASK_ID\",\"blocked_by\":\"$APPR_ID\",\"reason\":\"awaiting approval\"}"
 ```
+
+`update-task` auto-emits `task_updated` (with `from`/`to`). No manual `log-event task_blocked` needed — that would double-log. Add `--meta` context on the approval itself if the reason isn't obvious from the title.
 
 ### 3. Notify the user
 
