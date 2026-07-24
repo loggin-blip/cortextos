@@ -101,12 +101,23 @@ export async function run({ mode = 'incremental', dryRun = false } = {}) {
             continue;
           }
 
-          // Fetch existing element_kodes for this project to avoid overwriting status/montert_at
-          const { data: existingRows, error: fetchErr } = await supabase
-            .from('massivlust_prosjekt_elementer')
-            .select('element_kode')
-            .eq('project_id', projectId)
-            .eq('org_id', 'massivlust');
+          // Fetch existing element_kodes for this project to avoid overwriting status/montert_at.
+          // Paginated: PostgREST caps at 1000 rows/request. Projects with >1000
+          // elementer (f.eks. cd0c96aa=1155) fikk ellers overskuddet feilklassifisert
+          // som "nye" -> duplicate key (23505) paa re-INSERT hver kjoering.
+          let existingRows = [];
+          let fetchErr = null;
+          for (let from = 0; ; from += 1000) {
+            const { data: page, error: pErr } = await supabase
+              .from('massivlust_prosjekt_elementer')
+              .select('element_kode')
+              .eq('project_id', projectId)
+              .eq('org_id', 'massivlust')
+              .range(from, from + 999);
+            if (pErr) { fetchErr = pErr; break; }
+            existingRows = existingRows.concat(page || []);
+            if (!page || page.length < 1000) break;
+          }
 
           if (fetchErr) {
             failed++;
@@ -131,9 +142,11 @@ export async function run({ mode = 'incremental', dryRun = false } = {}) {
                 org_id: 'massivlust',
                 updated_at: new Date().toISOString(),
               }));
+              // upsert m/ ignoreDuplicates = idempotent: konflikt (project_id,element_kode)
+              // gjor INGENTING (beholder status/montert_at), feiler aldri paa duplikat.
               const { error } = await supabase
                 .from('massivlust_prosjekt_elementer')
-                .insert(chunk);
+                .upsert(chunk, { onConflict: 'project_id,element_kode', ignoreDuplicates: true });
               if (error) {
                 failed += chunk.length;
                 logger.error({ error, count: chunk.length }, 'Element INSERT chunk failed');
