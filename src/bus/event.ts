@@ -3,7 +3,12 @@ import { join } from 'path';
 import type { EventCategory, EventSeverity, BusPaths, Heartbeat } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomString } from '../utils/random.js';
-import { validateEventCategory, validateEventSeverity, isValidJson } from '../utils/validate.js';
+import {
+  validateEventCategory,
+  validateEventSeverity,
+  isValidJson,
+  warnUnknownEventName,
+} from '../utils/validate.js';
 
 /**
  * Log a structured event. Appends JSONL line to daily event file.
@@ -31,12 +36,20 @@ export function logEvent(
 ): void {
   validateEventCategory(category);
   validateEventSeverity(severity);
+  warnUnknownEventName(eventName);
 
-  // Parse metadata if it's a string
+  // Parse metadata if it's a string. Never silently swallow malformed JSON —
+  // preserve the raw payload under `_raw` and flag it so dashboard/greps can
+  // still find the context. Warn on stderr so the caller notices.
   let meta: Record<string, unknown> = {};
   if (typeof metadata === 'string') {
     if (isValidJson(metadata)) {
       meta = JSON.parse(metadata);
+    } else {
+      meta = { _raw: metadata.slice(0, 500), _meta_parse_error: true };
+      process.stderr.write(
+        `[bus] WARN: log-event --meta was not valid JSON; stored under metadata._raw (event=${eventName})\n`,
+      );
     }
   } else if (metadata) {
     meta = metadata;

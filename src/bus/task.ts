@@ -92,6 +92,20 @@ export function createTask(
 
   appendTaskAudit(paths, taskId, { event: 'create', agent: agentName, to: 'pending', note: title });
 
+  // Auto-emit: activity feed sees task creations without callers needing a
+  // separate log-event. Best-effort — task JSON is already persisted.
+  try {
+    logEvent(paths, agentName, org, 'task', 'task_created', 'info', {
+      task_id: taskId,
+      title,
+      assignee,
+      priority,
+      ...(project ? { project } : {}),
+    });
+  } catch {
+    // Never let observability break task creation.
+  }
+
   return taskId;
 }
 
@@ -273,11 +287,13 @@ export function updateTask(
   }
   let prevStatus: TaskStatus | undefined;
   let assignee: string | undefined;
+  let taskOrg: string = '';
   try {
     const content = readFileSync(filePath, 'utf-8');
     const task: Task = JSON.parse(content);
     prevStatus = task.status;
     assignee = task.assigned_to;
+    taskOrg = task.org || '';
     task.status = status;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));
@@ -285,6 +301,28 @@ export function updateTask(
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
   appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
+
+  // Auto-emit: activity feed sees status transitions without callers needing
+  // a separate log-event. Cross-org path rewrite matches completeTask so an
+  // orchestrator updating a specialist's task writes the event under the
+  // task's org, not the caller's. Best-effort — task JSON is already persisted.
+  // Skip completed (completeTask emits its own task_completed event).
+  if (assignee && status !== 'completed') {
+    try {
+      const pathOrgMatch = filePath.match(/[\\/]orgs[\\/](?<org>[^\\/]+)[\\/]tasks[\\/]/);
+      const fileOrg = pathOrgMatch?.groups?.org || '';
+      const eventPaths: BusPaths = fileOrg
+        ? { ...paths, analyticsDir: join(paths.ctxRoot, 'orgs', fileOrg, 'analytics') }
+        : paths;
+      logEvent(eventPaths, assignee, taskOrg, 'task', 'task_updated', 'info', {
+        task_id: taskId,
+        from: prevStatus,
+        to: status,
+      });
+    } catch {
+      // Never let observability break task update.
+    }
+  }
 }
 
 /**
@@ -463,6 +501,7 @@ export function completeTask(
   paths: BusPaths,
   taskId: string,
   result?: string,
+  outcome: 'success' | 'failure' = 'success',
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -482,6 +521,7 @@ export function completeTask(
     task.status = 'completed';
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     task.completed_at = task.updated_at;
+    task.outcome = outcome;
     if (result) {
       task.result = result;
     }
@@ -507,8 +547,9 @@ export function completeTask(
       const eventPaths: BusPaths = fileOrg
         ? { ...paths, analyticsDir: join(paths.ctxRoot, 'orgs', fileOrg, 'analytics') }
         : paths;
-      logEvent(eventPaths, assignee, taskOrg, 'task', 'task_completed', 'info', {
+      logEvent(eventPaths, assignee, taskOrg, 'task', 'task_completed', outcome === 'failure' ? 'warning' : 'info', {
         task_id: taskId,
+        outcome,
         ...(result ? { result } : {}),
       });
     } catch {

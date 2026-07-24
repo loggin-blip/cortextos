@@ -115,10 +115,9 @@ busCommand
       console.error(`Warning: agent '${to}' not found in project. Message will be queued but may never be read.`);
     }
 
-    const msgId = sendMessage(paths, env.agentName, to, priority as Priority, text, effectiveReplyTo);
-    try {
-      logEvent(paths, env.agentName, env.org, 'message', 'agent_message_sent', 'info', JSON.stringify({ to, priority, msg_id: msgId, reply_to: effectiveReplyTo ?? null }));
-    } catch { /* non-fatal */ }
+    // sendMessage auto-emits agent_message_sent when org is passed — no
+    // separate log-event call needed here.
+    const msgId = sendMessage(paths, env.agentName, to, priority as Priority, text, effectiveReplyTo, env.org);
     console.log(msgId);
   });
 
@@ -173,7 +172,7 @@ busCommand
       const assigneePaths = resolvePaths(opts.assignee, env.instanceId, env.org);
       const desc = opts.desc ? ` — ${opts.desc.slice(0, 120)}` : '';
       sendMessage(assigneePaths, env.agentName, opts.assignee, 'normal',
-        `Task assigned: [${opts.priority}] ${title}${desc} (id: ${taskId})`);
+        `Task assigned: [${opts.priority}] ${title}${desc} (id: ${taskId})`, undefined, env.org);
     }
   });
 
@@ -297,9 +296,15 @@ busCommand
   .argument('<id>', 'Task ID')
   .argument('[result]', 'Completion result (optional positional form)')
   .option('--result <text>', 'Completion result')
-  .action((id: string, resultArg: string | undefined, opts: { result?: string }) => {
+  .option('--outcome <outcome>', 'Task outcome: success | failure (default: success). Feeds KPI dashboards — a delivered-but-failed task must not count as success.', 'success')
+  .action((id: string, resultArg: string | undefined, opts: { result?: string; outcome: string }) => {
     // Accept result as either positional arg or --result flag (P1 fix #8)
     const effectiveResult = opts.result ?? resultArg;
+    const outcome = opts.outcome;
+    if (outcome !== 'success' && outcome !== 'failure') {
+      console.error(`Invalid --outcome '${outcome}'. Must be 'success' or 'failure'.`);
+      process.exit(1);
+    }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
 
@@ -312,8 +317,8 @@ busCommand
       }
     }
 
-    completeTask(paths, id, effectiveResult);
-    console.log(`Completed ${id}`);
+    completeTask(paths, id, effectiveResult, outcome as 'success' | 'failure');
+    console.log(`Completed ${id} (${outcome})`);
   });
 
 busCommand
@@ -1658,7 +1663,7 @@ busCommand
 
     // Also send via normal message bus for persistence
     try {
-      sendMessage(paths, env.agentName, targetAgent, 'urgent', message);
+      sendMessage(paths, env.agentName, targetAgent, 'urgent', message, undefined, env.org);
     } catch { /* signal already written */ }
 
     console.log(`Signal sent to ${targetAgent}`);
@@ -2743,7 +2748,7 @@ busCommand
           // Log to event bus
           if (!opts.dryRun) {
             try {
-              logEvent(paths, env.agentName, env.org, 'agent_activity' as any, 'tool_call', 'info', {
+              logEvent(paths, env.agentName, env.org, 'agent_activity', 'tool_call', 'info', {
                 line: trimmed,
                 session: sessionName,
                 high_signal: isHighSignal,

@@ -49,7 +49,7 @@ export function validatePriority(priority: string): asserts priority is Priority
 }
 
 const VALID_CATEGORIES: EventCategory[] = [
-  'action', 'error', 'metric', 'milestone', 'heartbeat', 'message', 'task', 'approval',
+  'action', 'error', 'metric', 'milestone', 'heartbeat', 'message', 'task', 'approval', 'agent_activity',
 ];
 
 export function validateEventCategory(category: string): asserts category is EventCategory {
@@ -58,6 +58,52 @@ export function validateEventCategory(category: string): asserts category is Eve
       `Invalid event category '${category}'. Must be one of: ${VALID_CATEGORIES.join(', ')}`
     );
   }
+}
+
+/**
+ * Registry of well-known event names. Soft-warn only — event_name is still
+ * free-text so the bus never rejects unknown ones. But the dashboard filters
+ * on specific strings, so a typo like `task_done` (vs canonical `task_completed`)
+ * silently disappears from feeds. warnUnknownEventName() prints one stderr line
+ * so the caller notices during development while never blocking the write.
+ *
+ * When adding a new canonical event name, add it here so future callers get
+ * autocomplete-via-grep and typos of it get flagged.
+ */
+export const KNOWN_EVENT_NAMES: ReadonlySet<string> = new Set([
+  // lifecycle
+  'session_start', 'session_end', 'bootstrap_check_failed',
+  // heartbeat
+  'agent_heartbeat', 'heartbeat', 'agent_unresponsive',
+  // tasks
+  'task_created', 'task_updated', 'task_completed', 'task_blocked', 'task_dispatched',
+  // approvals
+  'approval_created', 'approval_updated', 'approval_decided',
+  // messages
+  'message_sent', 'agent_message_sent', 'telegram_sent', 'telegram_received', 'inbox_ack',
+  // observability
+  'tool_call',
+  // orchestration
+  'briefing_sent', 'morning_briefing_ready', 'nighttime_mode_start',
+  'theta_wave_start', 'theta_wave_complete',
+  'worker_spawned', 'worker_completed',
+  // skill lifecycle
+  'skill_activated', 'skill_draft_created', 'skill_rejected',
+  // guardrails / ops
+  'guardrail_triggered', 'secret_rotated', 'deploy_failed',
+  // onboarding / research
+  'onboarding_complete', 'analyst_onboarding_handoff', 'research_complete',
+  // domain writes (Fase C wrapper — Jensen scripts etc.)
+  'domain_write',
+]);
+
+export function warnUnknownEventName(eventName: string): void {
+  if (KNOWN_EVENT_NAMES.has(eventName)) return;
+  process.stderr.write(
+    `[bus] WARN: unknown event_name '${eventName}' — not in KNOWN_EVENT_NAMES. ` +
+      `Dashboard filters on canonical names; typo like 'task_done' vs 'task_completed' will silently disappear. ` +
+      `If new, add to src/utils/validate.ts:KNOWN_EVENT_NAMES.\n`,
+  );
 }
 
 const VALID_SEVERITIES: EventSeverity[] = ['info', 'warning', 'error', 'critical'];

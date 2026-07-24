@@ -7,6 +7,7 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { acquireLock, releaseLock } from '../utils/lock.js';
 import { randomString } from '../utils/random.js';
 import { validateAgentName, validatePriority } from '../utils/validate.js';
+import { logEvent } from './event.js';
 
 // ---------------------------------------------------------------------------
 // Security (H10): HMAC-SHA256 message signing
@@ -47,6 +48,13 @@ function signPayload(msgId: string, from: string, to: string, text: string): str
  * Send a message to another agent's inbox.
  * Creates a JSON file with format: {pnum}-{epochMs}-from-{sender}-{rand5}.json
  * Identical to bash send-message.sh output.
+ *
+ * When `org` is provided, auto-emits a `message/agent_message_sent` event so
+ * daemon-side sends (auto-notify, approval decision, hard-restart notify, etc.)
+ * become visible on the activity feed without every call site needing to
+ * remember a paired log-event. CLI-side sends pass env.org so the emit
+ * happens uniformly regardless of where sendMessage is invoked. Best-effort —
+ * event write never blocks the message write itself.
  */
 export function sendMessage(
   paths: BusPaths,
@@ -55,6 +63,7 @@ export function sendMessage(
   priority: Priority,
   text: string,
   replyTo?: string,
+  org?: string,
 ): string {
   validateAgentName(from);
   validateAgentName(to);
@@ -83,6 +92,19 @@ export function sendMessage(
   const inboxDir = join(paths.ctxRoot, 'inbox', to);
   ensureDir(inboxDir);
   atomicWriteSync(join(inboxDir, filename), JSON.stringify(message));
+
+  if (org !== undefined) {
+    try {
+      logEvent(paths, from, org, 'message', 'agent_message_sent', 'info', {
+        to,
+        priority,
+        msg_id: msgId,
+        reply_to: replyTo ?? null,
+      });
+    } catch {
+      // Never let observability break message delivery.
+    }
+  }
 
   return msgId;
 }

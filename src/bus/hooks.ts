@@ -10,6 +10,8 @@ import { existsSync, readFileSync, appendFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { execFile } from 'child_process';
 import type { Event, EventCategory, EventSeverity } from '../types/index.js';
+import { logEvent } from './event.js';
+import { resolvePaths } from '../utils/paths.js';
 
 // ── Schema types — mirror RFC #15 §4 ─────────────────────────────────────────
 
@@ -263,7 +265,7 @@ export async function dispatchHook(hook: HookEntry, event: Event): Promise<void>
     result.action === 'escalate' ? 'hook_escalate' :
     'hook_fire';
 
-  emitHookBusEvent(eventName, {
+  emitHookBusEvent(eventName, event.agent, event.org, {
     ...(result.meta ?? {}),
     hook_id: hook.id,
     handler_type: hook.handler_type,
@@ -304,15 +306,35 @@ function logHookAttempt(hook: HookEntry, event: Event): void {
 //   - hook_block    — a hook matched + actively blocked the calling action (gate said NO)
 //   - hook_escalate — a hook matched + raised severity / re-routed (future use; not emitted by current code paths)
 type HookEmitName = 'hook_fire' | 'hook_block' | 'hook_escalate';
-function emitHookBusEvent(name: HookEmitName, meta: Record<string, unknown>): void {
+function emitHookBusEvent(
+  name: HookEmitName,
+  agent: string,
+  org: string,
+  meta: Record<string, unknown>,
+): void {
+  // Prefer in-process logEvent — Fable's storage review flagged the earlier
+  // execFile-per-hook path as a hot-path fire-and-forget subprocess cost
+  // (spawns node + reads CLI + parses commander for every hook fire). The
+  // event schema is identical to what the CLI would have written: the CLI
+  // path itself just calls logEvent() with the same args. Falls back to the
+  // legacy subprocess path only when we can't derive a paths context.
   try {
-    // PATH-unaware execFile is unreliable on Windows: the daemon spawned by
-    // PM2 doesn't inherit the npm-link target, so 'cortextos' fails ENOENT
-    // and hook audit events are silently dropped. Invoke via process.execPath
-    // + the bundled dist/cli.js path (same pattern as fast-checker.ts heartbeat
-    // watchdog) so PATH doesn't matter. CTX_FRAMEWORK_ROOT is set by the
-    // daemon at startup; if unset (rare — e.g. unit test), fall back to legacy
-    // PATH lookup so the test doesn't fail outright.
+    if (agent && org) {
+      const instanceId = process.env.CTX_INSTANCE_ID || 'default';
+      const paths = resolvePaths(agent, instanceId, org);
+      logEvent(paths, agent, org, 'action', name, 'info', meta);
+      return;
+    }
+  } catch {
+    // Fall through to legacy subprocess path — never let hook telemetry break.
+  }
+
+  try {
+    // Legacy subprocess fallback. PATH-unaware execFile is unreliable on
+    // Windows: the daemon spawned by PM2 doesn't inherit the npm-link target,
+    // so 'cortextos' fails ENOENT and hook audit events are silently dropped.
+    // Invoke via process.execPath + the bundled dist/cli.js path (same pattern
+    // as fast-checker.ts heartbeat watchdog) so PATH doesn't matter.
     const frameworkRoot = process.env.CTX_FRAMEWORK_ROOT;
     if (frameworkRoot) {
       const cliPath = join(frameworkRoot, 'dist', 'cli.js');

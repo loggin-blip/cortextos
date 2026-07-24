@@ -57,6 +57,14 @@ export interface Task {
   due_date: string | null;
   archived: boolean;
   result?: string;
+  /**
+   * Terminal outcome of the task — success or failure. Set at completeTask
+   * time via `cortextos bus complete-task --outcome`. Defaults to 'success'
+   * when the flag is omitted. Feeds KPI dashboards so a delivered-but-failed
+   * task (e.g. deploy attempted but failed) does not silently count as a win.
+   * Absent on tasks completed before this field existed.
+   */
+  outcome?: 'success' | 'failure';
   /** Linked deliverables (files saved via `cortextos bus save-output`). */
   outputs?: TaskOutput[];
   /**

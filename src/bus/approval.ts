@@ -8,6 +8,7 @@ import { validateApprovalCategory } from '../utils/validate.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { sendMessage } from './message.js';
 import { postActivity } from './system.js';
+import { logEvent } from './event.js';
 
 /**
  * Build the inline keyboard posted to the activity channel alongside a
@@ -225,6 +226,18 @@ export async function createApproval(
   // (the 50h+ Repo-B-style stall). Errors suppressed — see helper.
   await pingAgentChatId(agentDir, approvalId, title, category, agentName, context);
 
+  // Auto-emit: activity feed sees approval creations without callers
+  // needing a separate log-event. Best-effort — approval JSON is persisted.
+  try {
+    logEvent(paths, agentName, org, 'approval', 'approval_created', 'info', {
+      approval_id: approvalId,
+      title,
+      category,
+    });
+  } catch {
+    // Never let observability break approval creation.
+  }
+
   return approvalId;
 }
 
@@ -262,7 +275,19 @@ export function updateApproval(
     if (approval.requesting_agent) {
       const noteText = note ? ` Note: ${note}` : '';
       const msg = `Approval decision: ${status.toUpperCase()}\napproval_id: ${approvalId}\ndecision: ${status}${noteText}`;
-      sendMessage(paths, 'system', approval.requesting_agent, 'urgent', msg);
+      sendMessage(paths, 'system', approval.requesting_agent, 'urgent', msg, undefined, approval.org);
+    }
+
+    // Auto-emit: activity feed sees approval resolutions without callers
+    // needing a separate log-event. Best-effort — approval JSON is persisted.
+    try {
+      logEvent(paths, approval.requesting_agent || 'system', approval.org || '', 'approval', 'approval_updated', 'info', {
+        approval_id: approvalId,
+        status,
+        ...(note ? { note } : {}),
+      });
+    } catch {
+      // Never let observability break approval update.
     }
   } catch (err) {
     throw new Error(`Approval ${approvalId} not found: ${err}`);

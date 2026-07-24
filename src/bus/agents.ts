@@ -242,6 +242,7 @@ export function notifyAgent(
   targetAgent: string,
   message: string,
   ctxRoot: string,
+  org?: string,
 ): void {
   // Write signal file to state dir
   const signalDir = join(ctxRoot, 'state', targetAgent);
@@ -257,7 +258,7 @@ export function notifyAgent(
 
   // Also send via normal message bus for persistence
   try {
-    sendMessage(paths, from, targetAgent, 'urgent', message);
+    sendMessage(paths, from, targetAgent, 'urgent', message, undefined, org);
   } catch {
     // Ignore bus send failures - signal file is the primary mechanism
   }

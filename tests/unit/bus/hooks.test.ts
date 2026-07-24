@@ -8,15 +8,33 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import type { Event } from '../../../src/types/index';
 
-// Capture every execFile invocation so we can assert which bus event was emitted.
-// The dispatcher uses execFile('cortextos', ['bus', 'log-event', 'action', <name>, 'info', '--meta', <json>])
-// fire-and-forget — we intercept before it spawns anything.
+// Capture every emit invocation so we can assert which bus event was emitted.
+// A6 (2026-07-24) — hooks now prefer in-process logEvent over the legacy
+// execFile-per-hook subprocess when agent+org are available. Tests mock
+// BOTH paths: logEvent for the fast path, execFile for the fallback path
+// (agent/org missing OR resolvePaths throws). lastEmittedEvent() reads from
+// logEvent calls first, then falls back to execFile.
 const execFileCalls: Array<{ cmd: string; args: string[] }> = [];
 vi.mock('child_process', () => ({
   execFile: (cmd: string, args: string[], _opts: unknown, cb?: () => void) => {
     execFileCalls.push({ cmd, args: [...args] });
     if (typeof cb === 'function') cb();
     return { unref: () => {} };
+  },
+}));
+
+const logEventCalls: Array<{ agent: string; org: string; category: string; name: string; severity: string; meta: Record<string, unknown> }> = [];
+vi.mock('../../../src/bus/event', () => ({
+  logEvent: (
+    _paths: unknown,
+    agent: string,
+    org: string,
+    category: string,
+    name: string,
+    severity: string,
+    meta: Record<string, unknown>,
+  ) => {
+    logEventCalls.push({ agent, org, category, name, severity, meta });
   },
 }));
 
@@ -59,8 +77,13 @@ function makeHook(overrides: Partial<HookEntry> = {}): HookEntry {
   };
 }
 
-// Helper: read the meta JSON from the most recent execFile call.
+// Helper: read the meta JSON from the most recent emit (in-process logEvent
+// preferred; execFile fallback preserved for the no-agent/no-org path).
 function lastEmittedEvent(): { name: string; meta: Record<string, unknown> } | null {
+  if (logEventCalls.length > 0) {
+    const last = logEventCalls[logEventCalls.length - 1];
+    return { name: last.name, meta: last.meta };
+  }
   if (execFileCalls.length === 0) return null;
   const args = execFileCalls[execFileCalls.length - 1].args;
   // shape: [bus, log-event, action, <name>, info, --meta, <json>]
@@ -73,6 +96,7 @@ function lastEmittedEvent(): { name: string; meta: Record<string, unknown> } | n
 describe('src/bus/hooks — Day-2 per-handler wiring', () => {
   beforeEach(() => {
     execFileCalls.length = 0;
+    logEventCalls.length = 0;
     clearHandlerRegistry();
   });
 
