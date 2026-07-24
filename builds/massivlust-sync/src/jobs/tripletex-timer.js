@@ -76,11 +76,34 @@ export async function run({ mode = 'incremental', dryRun = false } = {}) {
           continue;
         }
 
-        const { error } = await supabase
+        // Two-step link: if an agent (Jensen dagrapport) already inserted this
+        // timer entry, it has null tripletex_entry_id. Match on
+        // (employee_id, dato, project_id) and UPDATE that row instead of
+        // creating a duplicate. Otherwise fall through to onConflict upsert.
+        let findQuery = supabase
           .from('massivlust_timer')
-          .upsert(row, { onConflict: 'tripletex_entry_id' });
+          .select('id')
+          .eq('employee_id', employeeId)
+          .eq('dato', entry.date)
+          .is('tripletex_entry_id', null);
+        findQuery = projectId
+          ? findQuery.eq('project_id', projectId)
+          : findQuery.is('project_id', null);
+        const { data: existing, error: findErr } = await findQuery.maybeSingle();
+        if (findErr) throw findErr;
 
-        if (error) throw error;
+        if (existing) {
+          const { error } = await supabase
+            .from('massivlust_timer')
+            .update(row)
+            .eq('id', existing.id);
+          if (error) throw error;
+        } else {
+          const { error } = await supabase
+            .from('massivlust_timer')
+            .upsert(row, { onConflict: 'tripletex_entry_id' });
+          if (error) throw error;
+        }
         upserted++;
       } catch (err) {
         failed++;
