@@ -12,6 +12,7 @@ import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
+import { tailFile } from '../utils/log-tail.js';
 import {
   computeBootstrapFingerprint,
   readBootstrapFingerprint,
@@ -507,24 +508,10 @@ export class AgentProcess {
    */
   private tailStdoutLog(maxBytes: number): string {
     const logPath = join(this.env.ctxRoot, 'logs', this.name, 'stdout.log');
-    try {
-      if (!existsSync(logPath)) return '';
-      const stats = statSync(logPath);
-      const start = Math.max(0, stats.size - maxBytes);
-      const len = stats.size - start;
-      // Synchronous read of the tail; small and bounded so the cost is fine
-      // even in the exit handler.
-      const fd = require('fs').openSync(logPath, 'r');
-      try {
-        const buf = Buffer.alloc(len);
-        const read = require('fs').readSync(fd, buf, 0, len, start);
-        return buf.toString('utf-8', 0, read);
-      } finally {
-        require('fs').closeSync(fd);
-      }
-    } catch {
-      return '';
-    }
+    // Shared bounded-window tail — see src/utils/log-tail.ts. Behavior is
+    // identical to the previous inline openSync/readSync block; extracted so
+    // AgentWatchdog can reuse the same primitive for usage-limit scans.
+    return tailFile(logPath, maxBytes);
   }
 
   /**

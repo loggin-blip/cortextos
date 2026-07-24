@@ -41,10 +41,19 @@ export function acquireLock(dir: string): boolean {
 
     const storedPid = parseInt(storedPidRaw, 10);
     if (isNaN(storedPid) || storedPidRaw === '') {
-      // Corrupt PID file.  Don't steal — let caller retry; if it persists
-      // the holder is broken and a future stale-detection pass (process.kill
-      // check below, after the PID is written cleanly) will recover.
-      return false;
+      // Empty/corrupt PID file — the holder died between mkdirSync and
+      // writeFileSync (or was killed mid-acquire).  Since the OS can never
+      // resurrect that gap, waiting for a "future stale-detection pass"
+      // means waiting forever.  Steal it the same way we steal a lock held
+      // by a dead PID.  Blocked kaptein inbox for 23 days before this fix.
+      try {
+        rmSync(lockDir, { recursive: true, force: true });
+        mkdirSync(lockDir);
+        writeFileSync(pidFile, String(process.pid));
+        return true;
+      } catch {
+        return false;
+      }
     }
 
     // Check if process is still alive

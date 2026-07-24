@@ -102,6 +102,8 @@ fi
 # CHECK 3: Node process leak (Next.js Turbopack spawns thousands)
 # ============================================================
 NODE_COUNT=$(pgrep -c node 2>/dev/null || echo 0)
+# Force base-10 to prevent octal interpretation of 08/09
+NODE_COUNT=$((10#${NODE_COUNT:-0}))
 NODE_THRESHOLD=100
 
 if [[ "$NODE_COUNT" -gt "$NODE_THRESHOLD" ]]; then
@@ -136,8 +138,8 @@ ACTIONS_TAKEN=0
 AGENTS_CHECKED=0
 PROBLEMS=""
 
-# Get expected agents from cortextos status
-AGENT_STATUSES=$(cortextos status 2>/dev/null || echo "")
+# Get expected agents from cortextos status (30s timeout — prevents hang during daemon startup)
+AGENT_STATUSES=$(perl -e 'alarm(30); exec @ARGV' -- cortextos status 2>/dev/null || echo "")
 
 if [[ -z "$AGENT_STATUSES" ]]; then
   log "WARN: cortextos status returned empty — daemon may be starting up"
@@ -169,6 +171,62 @@ while IFS= read -r line; do
     log "UNKNOWN: $agent_name status unclear: $line"
   fi
 done <<< "$AGENT_STATUSES"
+
+# ============================================================
+# CHECK 5: Active-agent stall — outbound silent + recent inbound
+# Covers kaptein (45 min) and key ML agents (90 min — less chatty).
+# Uses file mtime as the staleness proxy — simple and reliable.
+# ============================================================
+check_agent_stall() {
+  local agent="$1"
+  local stall_seconds="$2"
+  local OUTBOUND="$HOME/.cortextos/default/logs/$agent/outbound-messages.jsonl"
+  local INBOUND="$HOME/.cortextos/default/logs/$agent/inbound-messages.jsonl"
+  [[ -f "$OUTBOUND" ]] && [[ -f "$INBOUND" ]] || return
+  NOW_EPOCH=$(date +%s)
+  OUTBOUND_MTIME=$(stat -f %m "$OUTBOUND" 2>/dev/null || echo 0)
+  INBOUND_MTIME=$(stat -f %m "$INBOUND" 2>/dev/null || echo 0)
+  OUTBOUND_AGE=$(( NOW_EPOCH - OUTBOUND_MTIME ))
+  INBOUND_AGE=$(( NOW_EPOCH - INBOUND_MTIME ))
+  if [[ "$OUTBOUND_AGE" -gt "$stall_seconds" ]] && [[ "$INBOUND_AGE" -lt 3600 ]]; then
+    OUTBOUND_MIN=$(( OUTBOUND_AGE / 60 ))
+    INBOUND_MIN=$(( INBOUND_AGE / 60 ))
+    log "CRITICAL: $agent outbound stale ${OUTBOUND_MIN}m, inbound ${INBOUND_MIN}m ago — appears stuck. Hard-restarting."
+    perl -e 'alarm(15); exec @ARGV' -- cortextos bus hard-restart "$agent" --reason "fleet-watchdog: outbound ${OUTBOUND_MIN}m stale" 2>> "$LOG_FILE" || true
+    ACTIONS_TAKEN=$((ACTIONS_TAKEN + 1))
+    PROBLEMS="${PROBLEMS}
+- $agent: stuck (outbound ${OUTBOUND_MIN}m stale), hard-restarted"
+    send_telegram "WATCHDOG: $agent stille i ${OUTBOUND_MIN} min (inbound for ${INBOUND_MIN} min siden). Hard-restart trigget."
+  fi
+}
+
+# kaptein: main orchestrator, 45 min stall threshold
+check_agent_stall "kaptein" 2700
+# massivlust-team (Jensen): crew-facing, 90 min threshold
+check_agent_stall "massivlust-team" 5400
+# kaptein-massivlust: ML orchestrator, 90 min threshold
+check_agent_stall "kaptein-massivlust" 5400
+
+# ============================================================
+# CHECK 6: HALTED agents — crashed 10x in one day, stopped permanently
+# No auto-restart (HALT exists to stop loops) — just alert Max.
+# ============================================================
+HALTED_AGENTS=""
+while IFS= read -r line; do
+  [[ "$line" == *"Name"* ]] && continue
+  [[ "$line" == *"---"* ]] && continue
+  [[ -z "$line" ]] && continue
+  agent_name=$(echo "$line" | awk '{print $1}')
+  [[ -z "$agent_name" ]] && continue
+  if echo "$line" | grep -qi "halted"; then
+    log "ALERT: $agent_name is HALTED (crash limit exceeded)"
+    HALTED_AGENTS="${HALTED_AGENTS} $agent_name"
+  fi
+done <<< "$AGENT_STATUSES"
+
+if [[ -n "$HALTED_AGENTS" ]]; then
+  send_telegram "WATCHDOG: Agent(er) HALTET (for mange krasjer):${HALTED_AGENTS}. Restart manuelt: cortextos start <navn>"
+fi
 
 # ============================================================
 # REPORT — only Telegram on actual restarts
