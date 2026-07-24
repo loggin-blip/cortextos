@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Jensen Inspector</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="brand">
+      <span class="logo">JI</span>
+      <div>
+        <div class="title">Jensen Inspector</div>
+        <div class="sub">massivlust-team &middot; live surface view</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <input id="search" type="search" placeholder="filter surfaces..." autocomplete="off" />
+      <span id="conn" class="conn dead" title="SSE status">
+        <span class="dot"></span><span class="conn-text">offline</span>
+      </span>
+    </div>
+  </header>
+
+  <main>
+    <aside id="sidebar">
+      <div id="sidebar-scroll">
+        <section class="group" data-group="skills">
+          <h3>Skills <span class="count" id="count-skills">0</span></h3>
+          <ul id="list-skills"></ul>
+        </section>
+        <section class="group" data-group="crons">
+          <h3>Crons <span class="count" id="count-crons">0</span></h3>
+          <ul id="list-crons"></ul>
+        </section>
+        <section class="group" data-group="bootstrap">
+          <h3>Bootstrap <span class="count" id="count-bootstrap">0</span></h3>
+          <ul id="list-bootstrap"></ul>
+        </section>
+        <section class="group" data-group="logs">
+          <h3>Logs</h3>
+          <ul>
+            <li data-type="tg" data-id="stream"><span class="row-name">TG stream</span><span class="row-meta">live</span></li>
+          </ul>
+        </section>
+      </div>
+    </aside>
+
+    <section id="main">
+      <div id="pane">
+        <div class="empty">
+          <h2>Pick something from the sidebar.</h2>
+          <p>The dashboard reads directly from the file system. Edit a skill or config.json and the pane updates live.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
